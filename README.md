@@ -36,7 +36,7 @@ Prefer the command line? Run `npm i -g vercel`, then `vercel` in this folder, an
 5. Click **Save**.
 6. Go to **Deployments**, open the menu on the latest deployment and choose **Redeploy**. Vite reads variables while building, so a change only takes effect after a new build.
 
-From then on, anyone opening your live link searches the full TMDB catalog without entering anything. A player can still paste their own key in Settings to override it, and clearing it brings the default back.
+From then on, anyone opening your live link searches the full TMDB catalog without entering anything. The app has no key screen, so this variable is the only way to switch it on. Without it the app plays on its built-in dataset.
 
 With the CLI, the same thing is `vercel env add VITE_TMDB_KEY` followed by `vercel --prod`.
 

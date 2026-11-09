@@ -1,12 +1,9 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
-  Settings as SettingsIcon, Undo2, RotateCcw, Share2, X, Trophy, Search, Send,
-  CalendarDays, Users, KeyRound, Copy, Shuffle, Clapperboard, Play, Eye, EyeOff, Film, Ticket, LogOut,
+  Undo2, RotateCcw, Share2, X, Trophy, Search, Send,
+  CalendarDays, Users, Copy, Shuffle, Clapperboard, Play, Film, Ticket, LogOut,
 } from "lucide-react";
 import { createClient } from "@supabase/supabase-js";
-
-// Default TMDB key baked in at build time (set VITE_TMDB_KEY in Vercel). Players can still override it in Settings.
-const ENV_KEY = import.meta.env.VITE_TMDB_KEY || "";
 
 /* ───────────────────────── 1. BUILT-IN BOLLYWOOD DATASET ───────────────────────── */
 // A leading * on a cast token marks a cameo / special / guest appearance.
@@ -195,6 +192,17 @@ const CSS = `
 @keyframes fall{0%{transform:translateY(-12%) rotate(0deg);opacity:1}100%{transform:translateY(112vh) rotate(720deg);opacity:.9}}
 @keyframes rise{from{transform:translateY(26px) scale(.96);opacity:0}to{transform:none;opacity:1}}
 @media (prefers-reduced-motion:reduce){.fsl-spin{animation:none}.fsl *{animation-duration:.01ms!important}}
+.fsl-col,.fsl-narrow,.fsl-rooms{width:100%;margin-left:auto;margin-right:auto}
+.fsl-grid2{display:grid;gap:.75rem}
+.fsl-play{display:block}
+.fsl-mid .fsl-col{max-width:42rem}
+.fsl-mid .fsl-narrow,.fsl-mid .fsl-rooms,.fsl-wide .fsl-narrow{max-width:34rem}
+.fsl-wide .fsl-col{max-width:60rem}
+.fsl-wide .fsl-grid2{grid-template-columns:1fr 1fr;gap:1rem}
+.fsl-wide .fsl-play{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:1.5rem;align-items:start}
+.fsl-wide .fsl-play-b>:first-child{margin-top:0!important}
+.fsl-wide .fsl-rooms{max-width:none;column-count:2;column-gap:1.25rem}
+.fsl-wide .fsl-rooms>*{break-inside:avoid;margin-top:0!important;margin-bottom:1.25rem}
 `;
 
 const sprH = {
@@ -210,6 +218,8 @@ const btn = (bg, fg = C.cream) => ({
   background: bg, color: fg, border: `3px solid ${C.purple}`, boxShadow: `3px 4px 0 ${C.purple}`, fontFamily: DISPLAY,
 });
 
+// TMDB key is baked in at build time from the VITE_TMDB_KEY environment variable (set it in Vercel).
+const TMDB_KEY = import.meta.env.VITE_TMDB_KEY || "";
 const mem = {};
 const store = {
   get(k) { try { const v = window.localStorage.getItem(k); return v === null ? (mem[k] ?? null) : v; } catch (e) { return mem[k] ?? null; } },
@@ -324,9 +334,9 @@ const localApi = {
   async resolveActor(x) { const id = ACTORS[x.id] ? x.id : localIdByName(x.name); return id ? localActor(id) : null; },
 };
 
-const CAMEO_RE = /uncredited|cameo|special appearance|guest appearance|archive footage|\bhimself\b|\bherself\b|\bself\b/i;
-const NOISE_RE = /awards?\b|filmfare|iifa|zee cine|ceremony|red carpet/i;
-const badGenre = (g) => (g || []).some((x) => x === 99 || x === 10767 || x === 10763 || x === 10764);
+// ───────── TMDB ─────────
+// Nothing is filtered out. Every kind of credit TMDB returns (cast, crew, guest stars, uncredited rows)
+// is merged and de-duplicated, so cameos and special appearances are always included.
 const tmdbCache = {};
 function getTmdb(key) {
   if (tmdbCache[key]) return tmdbCache[key];
@@ -337,38 +347,109 @@ function getTmdb(key) {
     const url = new URL("https://api.themoviedb.org/3" + path);
     Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
     if (!bearer) url.searchParams.set("api_key", key);
-    const res = await fetch(url.toString(), bearer ? { headers: { Authorization: "Bearer " + key, accept: "application/json" } } : undefined);
+    const opts = bearer ? { headers: { Authorization: "Bearer " + key, accept: "application/json" } } : undefined;
+    let res = await fetch(url.toString(), opts);
+    if (res.status === 429) { await new Promise((r) => setTimeout(r, 800)); res = await fetch(url.toString(), opts); }
+    // A 404 just means "nothing there" (a removed person or film). Only real failures (bad key, outage) switch the app off TMDB.
+    if (res.status === 404) { cache.set(ck, {}); return {}; }
     if (!res.ok) throw new Error("TMDB " + res.status);
     const j = await res.json(); cache.set(ck, j); return j;
   };
   const img = (p) => (p ? "https://image.tmdb.org/t/p/w185" + p : null);
   const mv = (r) => ({ id: "t" + r.id, title: r.title || r.original_title || "Untitled", year: (r.release_date || "").slice(0, 4) || "—", poster: img(r.poster_path), src: "tmdb" });
   const ac = (r) => ({ id: "t" + r.id, name: r.name, photo: img(r.profile_path), src: "tmdb" });
-  const personCredits = async (aid) => (await get(`/person/${aid.slice(1)}/movie_credits`)).cast || [];
+  const uniqBy = (arr, keyOf) => { const seen = new Set(); return arr.filter((x) => { const k = keyOf(x); if (seen.has(k)) return false; seen.add(k); return true; }); };
+  // cast + guest stars + uncredited + crew, all in one list (cast first so real roles win when de-duplicating)
+  const everyCredit = (j) => [...(j.cast || []), ...(j.guest_stars || []), ...(j.uncredited || []), ...(j.crew || [])];
+  // Reads up to n result pages (page 1 must succeed so network problems surface; later pages are a bonus).
+  const pages = async (path, query, n = 3) => {
+    const first = await get(path, { query, include_adult: "false", page: "1" });
+    const last = Math.min(n, first.total_pages || 1);
+    const more = await Promise.all(Array.from({ length: Math.max(0, last - 1) }, (_, i) => get(path, { query, include_adult: "false", page: String(i + 2) }).catch(() => ({ results: [] }))));
+    return uniqBy([first, ...more].flatMap((j) => j.results || []), (r) => r.id);
+  };
+  // Spelling-tolerant helpers: "Shraddha" and "Shradha" look the same once the h's and doubled letters are gone.
+  const loose = (t) => norm(t).replace(/h/g, "").replace(/(.)\1+/g, "$1").replace(/ /g, "");
+  const lev = (a, b) => {
+    if (a === b) return 0;
+    const m = a.length, n = b.length;
+    if (!m) return n;
+    if (!n) return m;
+    let prev = Array.from({ length: n + 1 }, (_, j) => j);
+    for (let i = 1; i <= m; i++) {
+      const cur = [i];
+      for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+    return prev[n];
+  };
+  // The typed query plus alternate spellings and the first/last word, so one odd spelling never hides a match.
+  const queryVariants = (q) => {
+    const base = String(q).trim();
+    const n = norm(base);
+    const toks = n.split(" ").filter(Boolean);
+    const out = [base, n, n.replace(/(.)\1+/g, "$1"), n.replace(/sh/g, "s")];
+    if (toks.length > 1) { out.push(toks[0]); if (toks[toks.length - 1].length >= 3) out.push(toks[toks.length - 1]); }
+    return [...new Set(out.filter((x) => x && x.length >= 2))];
+  };
+  const rankSort = (list, scoreOf) => list.map((r, i) => ({ r, i, s: scoreOf(r) })).sort((a, b) => b.s - a.s || a.i - b.i).map((x) => x.r);
+  const personScore = (q, r) => {
+    const name = r.name || ""; const n = norm(name), qq = norm(q);
+    let s = n === qq ? 10 : n.startsWith(qq) ? 7 : n.includes(qq) ? 6 : 0;
+    const qt = qq.split(" ").filter(Boolean), nt = n.split(" ");
+    s += (qt.filter((t) => nt.some((w) => w === t || w.startsWith(t) || (w.length >= 3 && t.startsWith(w)))).length / Math.max(1, qt.length)) * 4;
+    const ln = loose(name), lq = loose(q);
+    if (ln === lq) s += 8; else if (lq.length > 2 && ln.includes(lq)) s += 5;
+    const d = lev(ln, lq);
+    if (d <= 2) s += 3 - d;
+    if (r.known_for_department === "Acting") s += 1;
+    return s + Math.min(2, (r.popularity || 0) / 25);
+  };
+  const titleScore = (q, text, bonus) => {
+    const t = norm(text), qq = norm(q);
+    let s = t === qq ? 6 : t.startsWith(qq) ? 4 : t.includes(qq) ? 3 : 0;
+    const lt = loose(text), lq = loose(q);
+    if (lt === lq) s += 4; else if (lq.length > 2 && lt.includes(lq)) s += 2;
+    if (lev(lt, lq) <= 2) s += 1;
+    return s + bonus;
+  };
+  const personCredits = async (aid) => everyCredit(await get(`/person/${aid.slice(1)}/movie_credits`));
+  const filmCredits = async (mid) => everyCredit(await get(`/movie/${mid.slice(1)}/credits`));
   const api = {
     kind: "tmdb",
     verify: () => get("/configuration"),
+    // Searches the typed name and its alternate spellings across several pages and merges everything.
+    // Results are ranked, never dropped, and people from every department are included.
     async searchActors(q) {
-      const j = await get("/search/person", { query: q, include_adult: "false" });
-      return (j.results || []).filter((r) => r.known_for_department === "Acting").slice(0, 8).map(ac);
+      const vs = queryVariants(q);
+      if (!vs.length) return [];
+      const [main, ...others] = await Promise.all([pages("/search/person", vs[0], 5), ...vs.slice(1).map((v) => pages("/search/person", v, 1).catch(() => []))]);
+      const all = uniqBy([...main, ...others.flat()], (r) => r.id);
+      return rankSort(all, (r) => personScore(q, r)).slice(0, 20).map(ac);
     },
     async searchMovies(q) {
-      const j = await get("/search/movie", { query: q, include_adult: "false" });
-      return (j.results || []).filter((r) => !badGenre(r.genre_ids)).slice(0, 8).map(mv);
+      const vs = queryVariants(q);
+      if (!vs.length) return [];
+      const [main, ...others] = await Promise.all([pages("/search/movie", vs[0], 3), ...vs.slice(1).map((v) => pages("/search/movie", v, 1).catch(() => []))]);
+      const all = uniqBy([...main, ...others.flat()], (r) => r.id);
+      return rankSort(all, (r) => titleScore(q, r.title || r.original_title || "", r.original_language === "hi" ? 1 : 0)).slice(0, 20).map(mv);
     },
-    async moviesOf(aid, cameos) {
+    // Every film the person is credited on (cast, crew, special appearances), unfiltered and without a size limit.
+    async moviesOf(aid) {
       const l = await personCredits(aid);
-      return l.filter((r) => r.release_date && !badGenre(r.genre_ids) && !NOISE_RE.test(r.title || "") && (cameos || !CAMEO_RE.test(r.character || "")))
-        .sort((a, b) => (b.popularity || 0) - (a.popularity || 0)).slice(0, 40).map(mv);
+      return uniqBy(l, (r) => r.id).sort((a, b) => (b.popularity || 0) - (a.popularity || 0)).map(mv);
     },
-    async castOf(mid, cameos) {
-      const j = await get(`/movie/${mid.slice(1)}/credits`);
-      return (j.cast || []).filter((r) => r.known_for_department === "Acting" && (cameos || !CAMEO_RE.test(r.character || ""))).slice(0, 50).map(ac);
+    // Every person credited on the film (cast, crew, guest stars, uncredited), unfiltered and without a size limit.
+    async castOf(mid) {
+      const l = await filmCredits(mid);
+      return uniqBy(l, (r) => r.id).map(ac);
     },
+    // Looks in the person's credits first, then in the film's full credit list, so a credit missing from one side is still found.
     async credit(aid, mid) {
-      const l = await personCredits(aid); const r = l.find((x) => "t" + x.id === mid);
-      if (!r || badGenre(r.genre_ids) || NOISE_RE.test(r.title || "")) return "no";
-      return CAMEO_RE.test(r.character || "") ? "cameo" : "yes";
+      const mine = await personCredits(aid);
+      if (mine.some((x) => "t" + x.id === mid)) return "yes";
+      const theirs = await filmCredits(mid);
+      return theirs.some((r) => "t" + r.id === aid) ? "yes" : "no";
     },
     async resolveActor(x) {
       const r = await api.searchActors(x.name);
@@ -508,13 +589,29 @@ const baseUrl = () => {
 };
 const roomActor = (x) => (x.src === "local" && ACTORS[x.id] ? localActor(x.id) : { ...x, photo: null });
 // Co-op boards sync as small records; local art is rebuilt on each device instead of being sent.
-const packNode = (n) => (n.type === "movie"
-  ? { type: "movie", id: n.id, title: n.title, year: n.year, src: n.src, ...(n.src === "tmdb" ? { poster: n.poster || null } : {}) }
-  : { type: "actor", id: n.id, name: n.name, src: n.src, ...(n.src === "tmdb" ? { photo: n.photo || null } : {}) });
-const unpackNode = (n) => (n.src === "local" && (n.type === "movie" ? MOVIES[n.id] : ACTORS[n.id])
-  ? { type: n.type, ...(n.type === "movie" ? localMovie(n.id) : localActor(n.id)) }
-  : n);
+const packNode = (n) => {
+  const base = n.type === "movie"
+    ? { type: "movie", id: n.id, title: n.title, year: n.year, src: n.src, ...(n.src === "tmdb" ? { poster: n.poster || null } : {}) }
+    : { type: "actor", id: n.id, name: n.name, src: n.src, ...(n.src === "tmdb" ? { photo: n.photo || null } : {}) };
+  return n.by ? { ...base, by: n.by } : base;
+};
+const unpackNode = (n) => {
+  const local = n.src === "local" && (n.type === "movie" ? MOVIES[n.id] : ACTORS[n.id]);
+  const out = local ? { type: n.type, ...(n.type === "movie" ? localMovie(n.id) : localActor(n.id)) } : n;
+  return n.by ? { ...out, by: n.by } : out;
+};
 const sigOf = (chain, won) => chain.map((n) => n.type + n.id).join(">") + (won ? "!" : "");
+const gameIsDone = (meta, players, coop) => {
+  const r = meta.round || 0;
+  if (!r) return true;
+  if ((meta.endedRound || 0) >= r) return true; // someone pressed End Game
+  const everyone = livePlayers(players);
+  if (everyone.length > 0 && everyone.every((p) => p.revealVote === r)) return true; // link revealed by all
+  if (meta.mode === "coop") return !!(coop && coop.round === r && coop.won);
+  const live = livePlayers(players);
+  const racers = live.filter((p) => p.round === r);
+  return racers.length > 0 && racers.every((p) => p.done) && live.every((p) => p.round === r);
+};
 const livePlayers = (ps) => {
   const newest = Math.max(0, ...ps.map((p) => p.ping || 0));
   return ps.filter((p) => newest - (p.ping || 0) < 45000);
@@ -572,6 +669,28 @@ function Toggle({ on, onChange, label, desc }) {
     </div>
   );
 }
+// Picks how much to scale the whole app for this screen and which layout to use.
+// Phones stay at 1x. Tablets and laptops scale up so text and buttons stay comfortable, and wide
+// screens switch to two columns. "mid" = one centred column, "wide" = two columns.
+function calcLayout() {
+  if (typeof window === "undefined") return { s: 1, mid: false, wide: false };
+  const w = window.innerWidth, h = window.innerHeight;
+  const sw = w >= 1800 ? 1.6 : w >= 1400 ? 1.4 : w >= 1024 ? 1.25 : w >= 768 ? 1.2 : w >= 640 ? 1.1 : 1;
+  const sh = h >= 1000 ? 1.6 : h >= 820 ? 1.3 : h >= 700 ? 1.15 : 1;
+  const s = Math.min(sw, sh);
+  const vw = w / s, vh = h / s;
+  return { s, mid: vw >= 640 && !(vw >= 800 && vh >= 560), wide: vw >= 800 && vh >= 560 };
+}
+function MiniToggle({ label, aria, on, onChange }) {
+  return (
+    <button role="switch" aria-checked={on} aria-label={aria || label} onClick={() => onChange(!on)} className="flex items-center justify-between gap-2 rounded-full" style={{ background: C.cream, border: `2px solid ${C.purple}`, boxShadow: `2px 3px 0 ${C.purple}`, height: 28, minWidth: 116, padding: "0 3px 0 12px" }}>
+      <span className="font-bold" style={{ fontSize: 12, color: C.purple }}>{label}</span>
+      <span className="relative rounded-full" style={{ width: 36, height: 20, background: on ? C.teal : "#c9b79a", border: `2px solid ${C.purple}`, transition: "background .2s" }}>
+        <span className="absolute rounded-full" style={{ top: 1, left: on ? 17 : 1, width: 14, height: 14, background: C.cream, border: `1.5px solid ${C.purple}`, transition: "left .2s" }} />
+      </span>
+    </button>
+  );
+}
 function Row({ item, type, onClick }) {
   return (
     <button type="button" onClick={onClick} className="w-full flex items-center gap-3 px-3 py-2 text-left" style={{ minHeight: 62, borderTop: `2px dashed ${C.purple}44`, background: "transparent" }}>
@@ -586,25 +705,77 @@ function Row({ item, type, onClick }) {
 
 /* ───────────────────────── 5. GAME PIECES ───────────────────────── */
 
-function ScoreCard({ card, meId, wins, onNext, onRoom, onClose }) {
+function AnswerScreen({ game, answer, solo, room }) {
+  const plural = (n) => `${n} movie${n === 1 ? "" : "s"}`;
+  return (
+    <div className="absolute inset-0 flex items-center justify-center px-3" style={{ background: "rgba(42,14,44,.84)", zIndex: 44 }}>
+      <PopCard className="relative w-full overflow-y-auto" style={{ maxHeight: "92%", maxWidth: 560, animation: "rise .5s ease-out" }}>
+        <Scallop color={C.pink} size={18} />
+        <div className="px-4 pt-3 pb-4">
+          <div className="text-center" style={{ ...markStyle(5), fontSize: 26 }}>THE LINK</div>
+          <div className="mt-2 text-center font-bold" style={{ fontSize: 14, color: C.purple, lineHeight: 1.2 }}>{game.a.name} to {game.b.name}</div>
+          {room && <div className="mt-1 text-center font-bold" style={{ fontSize: 12, color: C.teal }}>Everyone tapped Reveal Link.</div>}
+          <div className="mt-3 rounded-xl px-3 py-2 flex items-center gap-3" style={{ background: C.teal, color: C.cream, border: `2px solid ${C.purple}` }}>
+            <Trophy size={26} color={C.marigold} />
+            <div style={{ fontSize: 14, lineHeight: 1.25 }}>
+              {answer && answer.movies ? <b>Shortest possible link: {plural(answer.movies)}</b>
+                : answer && answer.unavailable ? "The shortest-link solver only knows the built-in reel, so it can’t show this pair."
+                : answer && answer.none ? "No link exists between these two stars."
+                : "Working out the shortest link…"}
+            </div>
+          </div>
+          <div className="mt-3">{answer && answer.nodes ? <FilmStripRow nodes={answer.nodes} /> : null}</div>
+          {solo && (
+            <div className="mt-4 grid grid-cols-1 gap-3">
+              <button onClick={solo.onNext} className="rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.teal), fontSize: 15 }}>Next Challenge ➔</button>
+              <button onClick={solo.onMore} className="rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 14 }}>More Challenges</button>
+              <button onClick={solo.onBack} className="text-center font-bold" style={{ fontSize: 12, color: C.teal }}>Back to my chain</button>
+            </div>
+          )}
+          {room && (
+            <div className="mt-4 grid grid-cols-1 gap-3">
+              <button onClick={room.onNext} disabled={room.voted} className="rounded-xl py-3" style={{ ...btn(room.voted ? C.teal : C.pink), fontSize: 15, opacity: room.voted ? 0.85 : 1 }}>{room.voted ? "Ready ✓" : "Next Challenge"}</button>
+              {room.text && <div className="text-center font-bold" style={{ fontSize: 13, color: C.teal }}>{room.text}</div>}
+              <button onClick={room.onLobby} className="rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 14 }}>Exit Lobby</button>
+            </div>
+          )}
+        </div>
+      </PopCard>
+    </div>
+  );
+}
+function RoomButtons({ roomUI }) {
+  return (
+    <div className="mt-3 grid grid-cols-1 gap-3">
+      <button onClick={roomUI.onNext} disabled={roomUI.voted} className="rounded-xl py-3" style={{ ...btn(roomUI.voted ? C.teal : C.pink), fontSize: 15, opacity: roomUI.voted ? 0.85 : 1 }}>{roomUI.voted ? "Ready ✓" : "Next Game"}</button>
+      {roomUI.text && <div className="text-center font-bold" style={{ fontSize: 13, color: C.teal }}>{roomUI.text}</div>}
+      <button onClick={roomUI.onLobby} className="rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}>Exit to Lobby</button>
+    </div>
+  );
+}
+function RaceResults({ card, game, meId, wins, roomUI, onClose }) {
   const medals = ["🥇", "🥈", "🥉"];
   const w = card.rows[0];
   const plural = (n) => `${n} movie${n === 1 ? "" : "s"}`;
   const tally = Object.values(wins).sort((a, b) => b.n - a.n);
+  const chainOf = (p) => (p.id === meId && game ? game.chain : (p.chain || []).map(unpackNode));
   return (
     <div className="absolute inset-0 flex items-center justify-center px-3" style={{ background: "rgba(42,14,44,.78)", zIndex: 45 }}>
-      <PopCard className="relative w-full overflow-y-auto" style={{ maxHeight: "92%", animation: "rise .5s ease-out" }}>
+      <PopCard className="relative w-full overflow-y-auto" style={{ maxHeight: "92%", maxWidth: 560, animation: "rise .5s ease-out" }}>
         <Scallop color={C.pink} size={18} />
         <div className="px-4 pt-3 pb-4">
-          <button onClick={onClose} aria-label="Close scorecard" className="absolute rounded-full flex items-center justify-center" style={{ top: 16, right: 14, width: 34, height: 34, background: C.cream, border: `2px solid ${C.purple}` }}><X size={18} color={C.purple} /></button>
+          <button onClick={onClose} aria-label="Close results" className="absolute rounded-full flex items-center justify-center" style={{ top: 16, right: 14, width: 34, height: 34, background: C.cream, border: `2px solid ${C.purple}` }}><X size={18} color={C.purple} /></button>
           <div className="text-center" style={{ ...markStyle(5), fontSize: 28 }}>SCORECARD</div>
           <div className="mt-3 text-center" style={{ fontFamily: DISPLAY, fontSize: 16, color: C.purple, lineHeight: 1.2 }}>
             {card.tie ? `Tie on ${plural(w.movies)}! ${w.name} finished first.` : `${w.name} wins with the lowest link: ${plural(w.movies)}!`}
           </div>
-          <div className="mt-3 space-y-2">
+          <div className="mt-3 space-y-3">
             {card.rows.map((p, i) => (
-              <BoardLine key={p.id} me={p.id === meId} lead={medals[i] || "🎞️"} title={`${p.name}${p.id === meId ? " (you)" : ""}: ${plural(p.movies)}`}
-                sub={i === 0 ? (card.tie ? "First to finish" : "Lowest link") : p.movies === w.movies ? "Same link, finished later" : `${p.movies - w.movies} extra movie${p.movies - w.movies === 1 ? "" : "s"}`} />
+              <div key={p.id}>
+                <BoardLine me={p.id === meId} lead={medals[i] || "🎞️"} title={`${p.name}${p.id === meId ? " (you)" : ""}: ${plural(p.movies)}`}
+                  sub={i === 0 ? (card.tie ? "First to finish" : "Lowest link") : p.movies === w.movies ? "Same link, finished later" : `${p.movies - w.movies} extra movie${p.movies - w.movies === 1 ? "" : "s"}`} />
+                <div className="mt-2"><FilmStripRow nodes={chainOf(p)} /></div>
+              </div>
             ))}
           </div>
           {tally.length > 0 && (
@@ -612,8 +783,7 @@ function ScoreCard({ card, meId, wins, onNext, onRoom, onClose }) {
               Session wins: {tally.map((t) => `${t.name} ${t.n}`).join(", ")}
             </div>
           )}
-          <button onClick={onNext} className="mt-4 w-full rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.pink), fontSize: 15 }}><Play size={18} /> Next challenge</button>
-          <button onClick={onRoom} className="mt-3 w-full rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}>Back to room</button>
+          <RoomButtons roomUI={roomUI} />
         </div>
       </PopCard>
     </div>
@@ -663,7 +833,7 @@ function GameHeader({ game, count }) {
     <div className="sticky top-0 z-20">
       <div style={{ background: C.film, borderBottom: `3px solid ${C.marigold}` }}>
         <div style={sprH} />
-        <div className="flex items-start gap-1 px-3 pb-2">
+        <div className="flex items-start gap-1 px-3 pb-2" style={{ maxWidth: "40rem", marginLeft: "auto", marginRight: "auto" }}>
           <div className="flex flex-col items-center" style={{ width: 76 }}>
             <Portrait item={game.a} size={50} />
             <div className="mt-2 text-center font-bold" style={{ color: C.cream, fontSize: 11, lineHeight: 1.1 }}>{game.a.name}</div>
@@ -689,8 +859,9 @@ function GameHeader({ game, count }) {
   );
 }
 
-function ChainCard({ node, index }) {
+function ChainCard({ node, index, meId, showBy }) {
   const isMovie = node.type === "movie";
+  const mine = !!(node.by && node.by.id === meId);
   return (
     <div className="flex items-center gap-3 rounded-xl px-3 py-2" style={{ background: C.cream, border: `3px solid ${C.purple}`, boxShadow: `inset 0 0 0 2px ${C.cream}, inset 0 0 0 4px ${C.teal}`, animation: index > 0 ? "lock 1.1s ease-out" : "rise .5s ease-out" }}>
       {isMovie ? <Poster item={node} w={54} /> : <Portrait item={node} size={60} />}
@@ -698,12 +869,15 @@ function ChainCard({ node, index }) {
         <div style={{ fontFamily: DISPLAY, fontSize: 15, lineHeight: 1.15, color: C.purple }}>{isMovie ? node.title : node.name}</div>
         {isMovie && <div className="font-bold" style={{ color: C.teal, fontSize: 14 }}>{node.year}</div>}
         {index === 0 && <span className="inline-block mt-1 rounded-full px-2 font-bold" style={{ background: C.pink, color: C.cream, fontSize: 11 }}>Starts here</span>}
+        {showBy && node.by && index > 0 && (
+          <span className="inline-block mt-1 rounded-full px-2 font-bold" style={{ background: mine ? C.teal : C.marigold, color: mine ? C.cream : C.ink, fontSize: 11 }}>{mine ? "You" : node.by.name} added {isMovie ? "movie" : "actor"}</span>
+        )}
       </div>
       {isMovie ? <Film size={20} color={C.teal} /> : <Clapperboard size={20} color={C.pink} />}
     </div>
   );
 }
-function FilmChain({ chain }) {
+function FilmChain({ chain, meId, showBy }) {
   return (
     <div className="relative rounded-2xl overflow-hidden" style={{ background: C.film, border: `3px solid ${C.purple}`, boxShadow: `4px 5px 0 ${C.purple}` }}>
       <div className="absolute inset-y-0 left-0" style={{ width: 16, ...sprV }} />
@@ -712,7 +886,7 @@ function FilmChain({ chain }) {
         {chain.map((n, i) => (
           <React.Fragment key={n.type + n.id}>
             {i > 0 && <div className="flex justify-center py-1"><Reel size={22} spin color={C.marigold} /></div>}
-            <ChainCard node={n} index={i} />
+            <ChainCard node={n} index={i} meId={meId} showBy={showBy} />
           </React.Fragment>
         ))}
       </div>
@@ -749,12 +923,12 @@ function StepInput({ type, prev, api, hints, cameos, used, onPick, onFail }) {
     const my = ++seq.current; setLoading(true);
     const t = setTimeout(async () => {
       try {
-        const r = type === "movie" ? await api.searchMovies(q) : await api.searchActors(q);
+        const r = type === "movie" ? await api.searchMovies(q, cameos) : await api.searchActors(q, cameos);
         if (my === seq.current) { setItems(r); setLoading(false); }
       } catch (e) { if (my === seq.current) { setLoading(false); onFail(); } }
     }, 250);
     return () => clearTimeout(t);
-  }, [q, hints, type, api]);
+  }, [q, hints, type, api, cameos]);
 
   const list = hints ? (pool || []).filter((x) => !q || norm(label(x)).includes(norm(q))) : items;
   const listVisible = hints ? open || q.length > 0 : q.trim().length >= 3;
@@ -799,7 +973,7 @@ function StepInput({ type, prev, api, hints, cameos, used, onPick, onFail }) {
             {list.map((x) => <Row key={x.id} item={x} type={type} onClick={() => pick(x)} />)}
             {!waiting && list.length === 0 && (
               <div className="px-3 py-3" style={{ fontSize: 14, color: C.ink }}>
-                {hints ? "No valid options match that spelling." : `Nothing in the reel matches “${q}”. ${api.kind === "local" ? "Add a TMDB key in Settings to search every film." : ""}`}
+                {hints ? "No valid options match that spelling." : `Nothing in the reel matches “${q}”. ${api.kind === "local" ? "The built-in reel doesn’t have that one yet." : ""}`}
               </div>
             )}
           </div>
@@ -830,7 +1004,7 @@ function FilmStripRow({ nodes }) {
   );
 }
 
-function WinModal({ game, optimal, onShare, onAgain, onMenu, onClose, board, meId, onNext }) {
+function WinModal({ game, optimal, onShare, onAgain, onMenu, onClose, board, meId, onNext, roomUI }) {
   const [view, setView] = useState("you");
   const movies = game.chain.filter((n) => n.type === "movie").length;
   const pieces = useMemo(() => Array.from({ length: 18 }, (_, i) => ({ left: (i * 37) % 100, delay: (i % 6) * 0.35, dur: 3 + (i % 4), ch: ["🎬", "🎞️", "✨", "🌼", "🟧", "🟪"][i % 6] })), []);
@@ -846,7 +1020,7 @@ function WinModal({ game, optimal, onShare, onAgain, onMenu, onClose, board, meI
       <div aria-hidden className="absolute inset-0 overflow-hidden pointer-events-none">
         {pieces.map((p, i) => <span key={i} className="absolute" style={{ left: `${p.left}%`, top: 0, fontSize: 22, animation: `fall ${p.dur}s linear ${p.delay}s infinite` }}>{p.ch}</span>)}
       </div>
-      <PopCard className="relative w-full overflow-y-auto" style={{ maxHeight: "92%", animation: "rise .5s ease-out" }}>
+      <PopCard className="relative w-full overflow-y-auto" style={{ maxHeight: "92%", maxWidth: 560, animation: "rise .5s ease-out" }}>
         <Scallop color={C.pink} size={18} />
         <div className="px-4 pt-3 pb-4">
           <button onClick={onClose} aria-label="Close results" className="absolute rounded-full flex items-center justify-center" style={{ top: 16, right: 14, width: 34, height: 34, background: C.cream, border: `2px solid ${C.purple}` }}><X size={18} color={C.purple} /></button>
@@ -871,11 +1045,15 @@ function WinModal({ game, optimal, onShare, onAgain, onMenu, onClose, board, meI
           <div className="mt-3">{nodes ? <FilmStripRow nodes={nodes} /> : <div className="text-center py-4" style={{ fontSize: 14 }}>No shortest link to show.</div>}</div>
           {board && <div className="mt-4"><Scoreboard board={board} meId={meId} /></div>}
           <button onClick={onShare} className="mt-4 w-full rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.pink), fontSize: 15 }}><Share2 size={18} /> Share Sneaky Link</button>
-          {onNext && <button onClick={onNext} className="mt-3 w-full rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.teal), fontSize: 15 }}>Next Challenge ➔</button>}
-          <div className="mt-3 grid grid-cols-2 gap-3">
-            <button onClick={onAgain} className="rounded-xl py-2" style={{ ...btn(C.teal), fontSize: 13 }}>Play again</button>
-            <button onClick={onMenu} className="rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}>{game.room ? "Back to room" : "More challenges"}</button>
-          </div>
+          {roomUI ? <RoomButtons roomUI={roomUI} /> : (
+            <>
+              {onNext && <button onClick={onNext} className="mt-3 w-full rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.teal), fontSize: 15 }}>Next Challenge ➔</button>}
+              <div className="mt-3 grid grid-cols-2 gap-3">
+                <button onClick={onAgain} className="rounded-xl py-2" style={{ ...btn(C.teal), fontSize: 13 }}>Play again</button>
+                <button onClick={onMenu} className="rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}>More challenges</button>
+              </div>
+            </>
+          )}
         </div>
       </PopCard>
     </div>
@@ -886,13 +1064,16 @@ function WinModal({ game, optimal, onShare, onAgain, onMenu, onClose, board, meI
 
 export default function App() {
   const [tab, setTab] = useState("daily");
-  const [cameos, setCameosS] = useState(() => store.get("fsl:cameos") === "1");
+  const [layout, setLayout] = useState(calcLayout);
+  useEffect(() => {
+    const f = () => setLayout((o) => { const n = calcLayout(); return o.s === n.s && o.mid === n.mid && o.wide === n.wide ? o : n; });
+    window.addEventListener("resize", f); window.addEventListener("orientationchange", f);
+    return () => { window.removeEventListener("resize", f); window.removeEventListener("orientationchange", f); };
+  }, []);
+  const cameos = true; // cameos are always on
   const [hints, setHintsS] = useState(() => store.get("fsl:hints") === "1");
-  const [apiKey, setApiKey] = useState(() => store.get("fsl:key") || ENV_KEY);
-  const [tmdbState, setTmdbState] = useState(ENV_KEY && !store.get("fsl:key") ? "ok" : "idle");
-  const [drawer, setDrawer] = useState(false);
-  const [draft, setDraft] = useState(() => store.get("fsl:key") || "");
-  const [showKey, setShowKey] = useState(false);
+  const apiKey = TMDB_KEY;
+  const [tmdbState, setTmdbState] = useState("idle");
   const [game, setGame] = useState(null);
   const [winOpen, setWinOpen] = useState(false);
   const [optimal, setOptimal] = useState(null);
@@ -900,10 +1081,13 @@ export default function App() {
   const [launching, setLaunching] = useState(false);
   const [pickA, setPickA] = useState(null);
   const [pickB, setPickB] = useState(null);
+  const [aText, setAText] = useState("");
+  const [bText, setBText] = useState("");
+  const [confirmEnd, setConfirmEnd] = useState(false);
   const [slot, setSlot] = useState("a");
   const [cq, setCq] = useState("");
   const [cres, setCres] = useState([]);
-  const [link, setLink] = useState("");
+  const [pairingHidden, setPairingHidden] = useState(0);
   const endRef = useRef(null);
   const firstKind = useRef(true);
   const toastT = useRef(null);
@@ -917,15 +1101,24 @@ export default function App() {
   const seenRound = useRef(0);
   const myRec = useRef(null);
   const [roomMode, setRoomMode] = useState("coop");
-  const [coopOrder, setCoopOrder] = useState([]);
-  const [scorecard, setScorecard] = useState(null);
+  const [results, setResults] = useState(null);
+  const [answer, setAnswer] = useState(null);
+  const [answerHidden, setAnswerHidden] = useState(0);
+  const [showPicker, setShowPicker] = useState(false);
   const [wins, setWins] = useState({});
   const gameRef = useRef(null);
   const coopVer = useRef(0);
   const coopSig = useRef("");
   const shownRound = useRef(0);
+  const endedSeen = useRef(0);
+  const joinedRound = useRef(0);
+  const startingRef = useRef(0);
+  const doneSeen = useRef(new Set());
+  const ruleStamp = useRef(0);
+  const cameosRef = useRef(false);
+  const hintsRef = useRef(false);
 
-  const setCameos = (v) => { setCameosS(v); store.set("fsl:cameos", v ? "1" : "0"); };
+  const setCameos = () => {};
   const setHints = (v) => { setHintsS(v); store.set("fsl:hints", v ? "1" : "0"); };
   const notify = (msg) => { setToast(msg); clearTimeout(toastT.current); toastT.current = setTimeout(() => setToast(null), 3200); };
 
@@ -956,7 +1149,7 @@ export default function App() {
     setLaunching(true);
     try {
       const a = await resolveFor(aObj), b = await resolveFor(bObj);
-      if (!a || !b) { notify("That star isn’t in the built-in reel. Add a TMDB key in Settings."); return; }
+      if (!a || !b) { notify("That star isn’t in the built-in reel."); return; }
       if (a.id === b.id) { notify("Pick two different stars!"); return; }
       if (rules) { setCameos(rules.cameos); setHints(rules.hints); }
       const init = roomInfo && roomInfo.init;
@@ -988,16 +1181,50 @@ export default function App() {
       return { ok: false, msg: `Already in your chain! Pick a different ${isMovie ? "movie" : "co-star"}, boss.` };
     }
     let r;
-    try { r = isMovie ? await api.credit(last.id, item.id) : await api.credit(item.id, last.id); } catch (e) { failApi(); return { ok: false, msg: "Couldn’t check that one. Try again!" }; }
+    try { r = isMovie ? await api.credit(last.id, item.id, cameos) : await api.credit(item.id, last.id, cameos); } catch (e) { failApi(); return { ok: false, msg: "Couldn’t check that one. Try again!" }; }
     const aName = isMovie ? last.name : item.name, mName = isMovie ? item.title : last.title;
-    if (r === "cameo" && !cameos) return { ok: false, msg: `Aha! ${aName} only had a cameo in “${mName}”. Switch on Include Cameos in Settings to count it.` };
+    if (r === "cameo" && !cameos) return { ok: false, msg: `Aha! ${aName} only had a cameo in “${mName}”. Flip the Cameos switch at the top to count it.` };
     if (r === "no") return { ok: false, msg: OOPS[hash(aName + mName) % OOPS.length](aName, mName) };
-    const node = { type: isMovie ? "movie" : "actor", ...item };
+    const coop = !!(game.room && game.room.mode === "coop");
+    const myName = (myRec.current && myRec.current.name) || rname.trim() || "Player";
+    const node = { type: isMovie ? "movie" : "actor", ...item, ...(coop ? { by: { id: pid.current, name: myName } } : {}) };
     const done = !isMovie && item.id === game.b.id;
-    return { ok: true, commit: () => setGame((g) => (g ? { ...g, chain: [...g.chain, node], won: done } : g)) };
+    return {
+      ok: true,
+      commit: async () => {
+        if (!coop) { setGame((g) => (g ? { ...g, chain: [...g.chain, node], won: done } : g)); return; }
+        // Co-op: if your partner added a step a moment ago, take theirs and ask for the next pick.
+        const code = game.room.code;
+        const cur = await kv.get("rc:" + code);
+        if (cur && cur.round === game.room.round && cur.ver > coopVer.current) {
+          const ch = cur.chain.map(unpackNode);
+          coopVer.current = cur.ver; coopSig.current = sigOf(ch, cur.won);
+          setGame((g) => (g ? { ...g, chain: ch, won: !!cur.won } : g));
+          notify("Your partner just added a step. Pick the next one!");
+          return;
+        }
+        const chain = [...game.chain, node];
+        const ver = coopVer.current + 1; coopVer.current = ver; coopSig.current = sigOf(chain, done);
+        setGame((g) => (g ? { ...g, chain, won: done } : g));
+        await kv.set("rc:" + code, { round: game.room.round, ver, chain: chain.map(packNode), won: done, by: pid.current });
+      },
+    };
   };
-  const undo = () => setGame((g) => (g && g.chain.length > 1 ? { ...g, chain: g.chain.slice(0, -1), won: false } : g));
-  const reset = () => setGame((g) => (g ? { ...g, chain: [g.chain[0]], won: false } : g));
+  const coopPush = async (chain, won) => {
+    if (!(game && game.room && game.room.mode === "coop")) return;
+    const ver = coopVer.current + 1; coopVer.current = ver; coopSig.current = sigOf(chain, won);
+    await kv.set("rc:" + game.room.code, { round: game.room.round, ver, chain: chain.map(packNode), won: !!won, by: pid.current });
+  };
+  const undo = () => {
+    if (!game || game.chain.length < 2) return;
+    const chain = game.chain.slice(0, -1);
+    setGame((g) => (g ? { ...g, chain, won: false } : g)); coopPush(chain, false);
+  };
+  const reset = () => {
+    if (!game) return;
+    const chain = [game.chain[0]];
+    setGame((g) => (g ? { ...g, chain, won: false } : g)); coopPush(chain, false);
+  };
 
   const shareResult = async () => {
     const movies = game.chain.filter((n) => n.type === "movie").length;
@@ -1005,34 +1232,12 @@ export default function App() {
     const text = `🎞️ Filmy Sneaky Link 🎬\n${game.a.name} ➜ ${game.b.name}\nLinked in ${movies} movie${movies === 1 ? "" : "s"}${optimal && optimal.movies ? ` (shortest: ${optimal.movies})` : ""}!\n\n${line}\n\nCan you beat it? ${challengeUrl(game.a, game.b, cameos, hints)}`;
     notify((await copyText(text)) ? "Copied! Paste it into your chat 🎬" : "Couldn’t copy. Select and copy manually.");
   };
-  const sendChallenge = async () => {
-    if (!pickA || !pickB) { notify("Pick a start and a target star first."); return; }
-    setRoomBusy(true);
-    let code;
-    try {
-      if (room) { code = room.code; await startRound("custom", pickA, pickB, "coop"); }
-      else {
-        code = await makeCode();
-        if (!code) { notify("Couldn’t make a room. Try again."); return; }
-        const ok = await autoRoom(code, pickA, pickB, { cameos, hints }, rname.trim() || store.get("fsl:name") || "Player 1");
-        if (!ok) return;
-      }
-    } finally { setRoomBusy(false); }
-    const url = `${challengeUrl(pickA, pickB, cameos, hints)}&room=${code}`; setLink(url);
-    notify((await copyText(url)) ? "Link copied! Your co-op board is open. Your friend joins from the link." : "Link ready below. Copy it manually.");
-  };
-  const saveKey = async (raw) => {
-    const k = raw.trim();
-    if (!k) { store.del("fsl:key"); setApiKey(ENV_KEY); setTmdbState(ENV_KEY ? "ok" : "idle"); notify(ENV_KEY ? "Your key was removed. Using the app’s default TMDB key." : "TMDB key removed. Back to the built-in reel."); return; }
-    store.set("fsl:key", k); setApiKey(k); setTmdbState("checking");
-    try { await getTmdb(k).verify(); setTmdbState("ok"); notify("TMDB connected. Every film is in play!"); } catch (e) { setTmdbState("fail"); notify("Couldn’t reach TMDB with that key. Using the built-in reel."); }
-  };
-
-  // ── Multiplayer rooms
+    // ── Multiplayer rooms
+  cameosRef.current = cameos; hintsRef.current = hints;
   const writeMe = async (patch, code) => {
     const c = code || (room && room.code);
     if (!c) return;
-    myRec.current = { ...(myRec.current || { id: pid.current, name: rname.trim() || "Player", round: 0, movies: 0, done: false, doneAt: 0 }), ...patch, ping: Date.now() };
+    myRec.current = { ...(myRec.current || { id: pid.current, name: rname.trim() || "Player", round: 0, inGame: false, nextVote: 0, movies: 0, done: false, doneAt: 0 }), ...patch, ping: Date.now() };
     const rec = myRec.current;
     await kv.set(`rp:${c}:${pid.current}`, rec);
     setRoomData((d) => (d ? { ...d, players: [...d.players.filter((p) => p.id !== rec.id), rec] } : d));
@@ -1049,7 +1254,8 @@ export default function App() {
     if (!meta) return null;
     const keys = await kv.list(`rp:${code}:`);
     const players = (await Promise.all(keys.map((k) => kv.get(k)))).filter(Boolean);
-    return { meta, players };
+    const coop = await kv.get("rc:" + code);
+    return { meta, players, coop };
   };
   const makeCode = async () => {
     const pool = [...ROOM_CODES].sort(() => Math.random() - 0.5).slice(0, 5);
@@ -1060,6 +1266,7 @@ export default function App() {
     }
     return null;
   };
+  const resetRoomUi = () => { setResults(null); setWins({}); shownRound.current = 0; joinedRound.current = 0; startingRef.current = 0; doneSeen.current = new Set(); setShowPicker(false); };
   const createRoom = async () => {
     const name = rname.trim();
     if (!name) { notify("Add your name first."); return; }
@@ -1069,8 +1276,8 @@ export default function App() {
       if (!code) { notify("Couldn’t make a room. Try again."); return; }
       const meta = { code, host: pid.current, hostName: name, round: 0, created: Date.now() };
       if (!(await kv.set("room:" + code, meta))) { notify("Couldn’t save the room. Try again."); return; }
-      store.set("fsl:name", name); myRec.current = null; seenRound.current = 0;
-      setRoom({ code }); setRoomData({ meta, players: [] });
+      store.set("fsl:name", name); myRec.current = null; seenRound.current = 0; resetRoomUi();
+      setRoom({ code }); setRoomData({ meta, players: [], coop: null });
       await writeMe({ name, joined: Date.now() }, code);
       notify(`Room ${code} is live! Share the code.`);
     } finally { setRoomBusy(false); }
@@ -1083,7 +1290,7 @@ export default function App() {
     try {
       const d = await fetchRoom(code);
       if (!d) { notify(`No room “${code}” found.${kv.shared() ? "" : " Without Supabase set up, only rooms made on this device are visible."}`); return; }
-      store.set("fsl:name", name); myRec.current = null; seenRound.current = d.meta.round || 0;
+      store.set("fsl:name", name); myRec.current = null; seenRound.current = d.meta.round || 0; resetRoomUi();
       setRoom({ code }); setRoomData(d);
       await writeMe({ name, joined: Date.now() }, code);
       notify(`Welcome to room ${code}!`);
@@ -1093,45 +1300,86 @@ export default function App() {
     if (!room) return;
     await kv.del(`rp:${room.code}:${pid.current}`);
     setGame((g) => (g && g.room ? { ...g, room: null } : g));
-    setRoom(null); setRoomData(null); myRec.current = null;
-    setCoopOrder([]); setScorecard(null); setWins({}); shownRound.current = 0;
+    setRoom(null); setRoomData(null); myRec.current = null; resetRoomUi();
   };
-  const startRound = async (kind, aIn, bIn, modeIn) => {
-    if (!room) return;
+  // Starts a new game for the whole room. Only one game can be live at a time.
+  const startRound = async (kind, aIn, bIn, modeIn, opts = {}) => {
+    if (!room) return false;
     const mode = modeIn || roomMode;
-    let aObj, bObj;
-    try { aObj = await resolveFor(aIn); bObj = await resolveFor(bIn); } catch (e) { failApi(); return; }
-    if (!aObj || !bObj) { notify("That star isn’t in the built-in reel. Add a TMDB key in Settings."); return; }
     const cur = await fetchRoom(room.code);
     const base = (cur && cur.meta) || (roomData && roomData.meta) || { code: room.code };
-    const ref = (x) => ({ id: x.id, name: x.name, src: x.src });
-    const meta = { ...base, round: (base.round || 0) + 1, kind, mode, a: ref(aObj), b: ref(bObj), cameos, hints, startedBy: rname.trim() || "Someone", startedById: pid.current, startedAt: Date.now() };
-    const startNode = { type: "actor", ...aObj };
-    if (mode === "coop") {
-      const order = [pid.current, ...livePlayers((cur && cur.players) || []).map((p) => p.id).filter((id) => id !== pid.current)];
-      coopVer.current = 1; coopSig.current = sigOf([startNode], false); setCoopOrder(order);
-      await kv.set("rc:" + room.code, { round: meta.round, ver: 1, order, chain: [packNode(startNode)], won: false, by: pid.current });
+    if (opts.expectRound !== undefined && (base.round || 0) !== opts.expectRound) return false;
+    if (!opts.force && cur && (base.round || 0) > 0 && !gameIsDone(base, cur.players, cur.coop)) {
+      notify("A game is already running. Finish it or skip it first.");
+      return false;
     }
+    let aObj, bObj;
+    try { aObj = await resolveFor(aIn); bObj = await resolveFor(bIn); } catch (e) { failApi(); return false; }
+    if (!aObj || !bObj) { notify("That star isn’t in the built-in reel."); return false; }
+    const ref = (x) => ({ id: x.id, name: x.name, src: x.src });
+    const meta = { ...base, round: (base.round || 0) + 1, kind, mode, pending: null, a: ref(aObj), b: ref(bObj), cameos, hints, startedBy: (myRec.current && myRec.current.name) || rname.trim() || "Someone", startedById: pid.current, startedAt: Date.now() };
+    const startNode = { type: "actor", ...aObj };
+    const coopDoc = mode === "coop" ? { round: meta.round, ver: 1, chain: [packNode(startNode)], won: false, by: pid.current } : null;
+    if (coopDoc) { coopVer.current = 1; coopSig.current = sigOf([startNode], false); await kv.set("rc:" + room.code, coopDoc); }
     await kv.set("room:" + room.code, meta);
-    seenRound.current = meta.round;
-    setRoomData((d) => (d ? { ...d, meta } : d));
+    seenRound.current = meta.round; joinedRound.current = meta.round;
+    setRoomData((d) => (d ? { ...d, meta, coop: coopDoc || d.coop } : d));
+    setShowPicker(false); setResults(null);
     await launch(aObj, bObj, { cameos, hints }, { code: room.code, round: meta.round, mode });
+    await writeMe({ round: meta.round, inGame: true, nextVote: 0, skip: false, movies: 0, done: false, doneAt: 0, chain: null });
+    return true;
   };
-  const joinRound = async () => {
-    const m = roomData && roomData.meta;
+  const joinBoard = async (code, m) => {
     if (!m || !m.a) return;
-    const info = { code: room.code, round: m.round, mode: m.mode || "race" };
+    const info = { code, round: m.round, mode: m.mode || "race" };
     if (info.mode === "coop") {
-      const c = await kv.get("rc:" + room.code);
+      const c = await kv.get("rc:" + code);
       if (c && c.round === m.round) {
-        let order = c.order || []; let ver = c.ver;
-        if (!order.includes(pid.current)) { order = [...order, pid.current]; ver = c.ver + 1; await kv.set("rc:" + room.code, { ...c, order, ver }); }
         const chain = c.chain.map(unpackNode);
-        coopVer.current = ver; coopSig.current = sigOf(chain, c.won); setCoopOrder(order);
+        coopVer.current = c.ver; coopSig.current = sigOf(chain, c.won);
         info.init = { chain, won: !!c.won };
       }
     }
-    launch(roomActor(m.a), roomActor(m.b), { cameos: !!m.cameos, hints: !!m.hints }, info);
+    await launch(roomActor(m.a), roomActor(m.b), { cameos: !!m.cameos, hints: !!m.hints }, info);
+    await writeMe({ round: m.round, inGame: true, nextVote: 0, skip: false, movies: 0, done: false, doneAt: 0, chain: null }, code);
+  };
+  const joinRound = () => joinBoard(room.code, rmeta);
+  // Used when someone opens a shared challenge link (?a=..&b=..&room=..):
+  // joins the room if it exists, otherwise creates it as a Custom Co-op room for the given pair.
+  const autoRoom = async (code, A, B, rules, name) => {
+    setRoomBusy(true);
+    try {
+      store.set("fsl:name", name); setRname(name); myRec.current = null; resetRoomUi();
+      const d = await fetchRoom(code);
+      if (d && d.meta.round > 0 && d.meta.a && !((d.meta.endedRound || 0) >= d.meta.round)) {
+        seenRound.current = d.meta.round; joinedRound.current = d.meta.round;
+        setRoom({ code }); setRoomData(d);
+        await writeMe({ name, joined: Date.now() }, code);
+        await joinBoard(code, d.meta);
+        notify(`Joined room ${code}. The shared board is ready!`);
+        return true;
+      }
+      let aO, bO;
+      try { aO = await resolveFor(A); bO = await resolveFor(B); } catch (e) { failApi(); return false; }
+      if (!aO || !bO) { notify("That star isn’t in the built-in reel."); return false; }
+      const ref = (x) => ({ id: x.id, name: x.name, src: x.src });
+      const meta = {
+        ...(d ? d.meta : { code, host: pid.current, hostName: name, created: Date.now() }),
+        round: ((d && d.meta.round) || 0) + 1, kind: "custom", mode: "coop", pending: null, a: ref(aO), b: ref(bO),
+        cameos: !!rules.cameos, hints: !!rules.hints, startedBy: name, startedById: pid.current, startedAt: Date.now(),
+      };
+      const startNode = { type: "actor", ...aO };
+      const coopDoc = { round: meta.round, ver: 1, chain: [packNode(startNode)], won: false, by: pid.current };
+      await kv.set("rc:" + code, coopDoc);
+      await kv.set("room:" + code, meta);
+      coopVer.current = 1; coopSig.current = sigOf([startNode], false);
+      seenRound.current = meta.round; joinedRound.current = meta.round;
+      setRoom({ code }); setRoomData({ meta, players: [], coop: coopDoc });
+      await writeMe({ name, joined: Date.now() }, code);
+      await launch(aO, bO, { cameos: !!rules.cameos, hints: !!rules.hints }, { code, round: meta.round, mode: "coop" });
+      await writeMe({ round: meta.round, inGame: true, nextVote: 0, skip: false, movies: 0, done: false, doneAt: 0 }, code);
+      return true;
+    } finally { setRoomBusy(false); }
   };
   useEffect(() => {
     if (!room) return undefined;
@@ -1140,19 +1388,48 @@ export default function App() {
       const d = await fetchRoom(room.code);
       if (!live || !d) return;
       setRoomData(d);
+      // Cameo / hint switches are shared by everyone in the room once a game exists.
+      if (Date.now() - ruleStamp.current > 4000 && (d.meta.round || 0) > 0) {
+        if (typeof d.meta.cameos === "boolean" && d.meta.cameos !== cameosRef.current) setCameos(d.meta.cameos);
+        if (typeof d.meta.hints === "boolean" && d.meta.hints !== hintsRef.current) setHints(d.meta.hints);
+      }
+      // Somebody pressed End Game: everyone still on that game drops back to the lobby.
+      const g0 = gameRef.current;
+      if ((d.meta.endedRound || 0) > 0 && g0 && g0.room && g0.room.code === room.code && g0.room.round <= d.meta.endedRound && endedSeen.current !== d.meta.endedRound) {
+        endedSeen.current = d.meta.endedRound;
+        if (d.meta.endedById !== pid.current) notify(`${d.meta.endedBy || "Someone"} ended the game.`);
+        setGame(null); setWinOpen(false); setResults(null); setTab((t) => (t === "play" ? "rooms" : t));
+        writeMe({ inGame: false });
+      }
+      // Race: tell me when somebody else finishes.
+      if (d.meta.mode === "race") {
+        livePlayers(d.players).forEach((p) => {
+          const k = p.id + ":" + p.round;
+          if (p.id !== pid.current && p.round === d.meta.round && p.done && !doneSeen.current.has(k)) {
+            doneSeen.current.add(k);
+            notify(`${p.name} finished in ${p.movies} movie${p.movies === 1 ? "" : "s"}!`);
+          }
+        });
+      }
+      // Co-op: pull in the shared board and say who added what.
       const g = gameRef.current;
       if (d.meta.mode === "coop" && g && g.room && g.room.mode === "coop" && g.room.code === room.code && g.room.round === d.meta.round) {
-        const c = d.coop !== undefined ? d.coop : await kv.get("rc:" + room.code);
-        if (!live) return;
+        const c = d.coop;
         if (c && c.round === g.room.round && c.ver > coopVer.current) {
           const ch = c.chain.map(unpackNode);
-          coopVer.current = c.ver; coopSig.current = sigOf(ch, c.won); setCoopOrder(c.order || []);
+          const before = g.chain.length;
+          coopVer.current = c.ver; coopSig.current = sigOf(ch, c.won);
+          const last = ch[ch.length - 1];
+          if (ch.length > before && last && last.by && last.by.id !== pid.current) {
+            notify(`${last.by.name} added ${last.type === "movie" ? "movie" : "actor"}: ${last.type === "movie" ? last.title : last.name}`);
+          }
           setGame((cur) => (cur && cur.room && cur.room.round === c.round ? { ...cur, chain: ch, won: !!c.won } : cur));
         }
       }
       if ((d.meta.round || 0) > seenRound.current) {
         seenRound.current = d.meta.round;
-        if (d.meta.startedById !== pid.current) notify(`${d.meta.startedBy} started a match! Open Rooms to join the race.`);
+        const voted = myRec.current && myRec.current.nextVote > 0;
+        if (d.meta.startedById !== pid.current && !voted) notify(`${d.meta.startedBy} started a ${d.meta.mode === "coop" ? "co-op" : "race"} game! Open Rooms to join.`);
       }
     };
     tick();
@@ -1167,69 +1444,22 @@ export default function App() {
     const beat = setInterval(() => writeMe({}), 12000);
     return () => { live = false; clearInterval(poll); clearInterval(beat); clearTimeout(kickT); if (channel) sb.removeChannel(channel); };
   }, [room && room.code]);
-  const joinBoard = async (code, m) => {
-    if (!m || !m.a) return;
-    const info = { code, round: m.round, mode: m.mode || "race" };
-    if (info.mode === "coop") {
-      const c = await kv.get("rc:" + code);
-      if (c && c.round === m.round) {
-        let order = c.order || []; let ver = c.ver;
-        if (!order.includes(pid.current)) { order = [...order, pid.current]; ver = c.ver + 1; await kv.set("rc:" + code, { ...c, order, ver }); }
-        const chain = c.chain.map(unpackNode);
-        coopVer.current = ver; coopSig.current = sigOf(chain, c.won); setCoopOrder(order);
-        info.init = { chain, won: !!c.won };
-      }
-    }
-    await launch(roomActor(m.a), roomActor(m.b), { cameos: !!m.cameos, hints: !!m.hints }, info);
-  };
-  // Used by "Send Sneaky Link Challenge" and by friends opening that link:
-  // joins the room if it exists, otherwise creates it as a Custom Co-op room for the given pair.
-  const autoRoom = async (code, A, B, rules, name) => {
-    setRoomBusy(true);
-    try {
-      store.set("fsl:name", name); setRname(name); myRec.current = null; setWins({}); shownRound.current = 0;
-      const d = await fetchRoom(code);
-      if (d && d.meta.round > 0 && d.meta.a) {
-        seenRound.current = d.meta.round;
-        setRoom({ code }); setRoomData(d);
-        await writeMe({ name, joined: Date.now() }, code);
-        await joinBoard(code, d.meta);
-        notify(`Joined room ${code}. The shared board is ready!`);
-        return true;
-      }
-      let aO, bO;
-      try { aO = await resolveFor(A); bO = await resolveFor(B); } catch (e) { failApi(); return false; }
-      if (!aO || !bO) { notify("That star isn’t in the built-in reel. Add a TMDB key in Settings."); return false; }
-      const ref = (x) => ({ id: x.id, name: x.name, src: x.src });
-      const meta = {
-        ...(d ? d.meta : { code, host: pid.current, hostName: name, created: Date.now() }),
-        round: ((d && d.meta.round) || 0) + 1, kind: "custom", mode: "coop", a: ref(aO), b: ref(bO),
-        cameos: !!rules.cameos, hints: !!rules.hints, startedBy: name, startedById: pid.current, startedAt: Date.now(),
-      };
-      const startNode = { type: "actor", ...aO }; const order = [pid.current];
-      await kv.set("rc:" + code, { round: meta.round, ver: 1, order, chain: [packNode(startNode)], won: false, by: pid.current });
-      await kv.set("room:" + code, meta);
-      coopVer.current = 1; coopSig.current = sigOf([startNode], false); setCoopOrder(order);
-      seenRound.current = meta.round;
-      setRoom({ code }); setRoomData({ meta, players: [] });
-      await writeMe({ name, joined: Date.now() }, code);
-      await launch(aO, bO, { cameos: !!rules.cameos, hints: !!rules.hints }, { code, round: meta.round, mode: "coop" });
-      return true;
-    } finally { setRoomBusy(false); }
-  };
+
   const gameRound = game && game.room ? game.room.round : 0;
   useEffect(() => {
-    if (!game || !game.room || !room || game.room.code !== room.code) return;
+    if (!game || !game.room || game.room.mode !== "race" || !room || game.room.code !== room.code) return;
     const mv = game.chain.filter((n) => n.type === "movie").length;
-    writeMe({ round: game.room.round, movies: mv, done: !!game.won, doneAt: game.won ? Date.now() : 0 });
+    writeMe({ round: game.room.round, movies: mv, done: !!game.won, doneAt: game.won ? Date.now() : 0, chain: game.won ? game.chain.map(packNode) : null });
   }, [gameRound, chainLen, won]);
+
+  // ── What the room looks like right now
+  const coopMode = !!(game && game.room && game.room.mode === "coop");
   const rmeta = roomData ? roomData.meta : null;
-  const inMatch = !!(game && game.room && room && rmeta && game.room.code === room.code && game.room.round === rmeta.round);
+  const round = rmeta ? rmeta.round || 0 : 0;
+  const liveList = useMemo(() => (roomData ? livePlayers(roomData.players) : []), [roomData]);
   const board = useMemo(() => {
     if (!roomData) return null;
-    const ps = roomData.players;
-    const newest = Math.max(0, ...ps.map((p) => p.ping || 0));
-    const live = ps.filter((p) => newest - (p.ping || 0) < 45000);
+    const live = livePlayers(roomData.players);
     const r = roomData.meta.round || 0;
     const racers = live.filter((p) => r > 0 && p.round === r);
     return {
@@ -1239,43 +1469,164 @@ export default function App() {
       idle: live.filter((p) => !(r > 0 && p.round === r)),
     };
   }, [roomData]);
+  const inMatch = !!(game && game.room && room && rmeta && game.room.code === room.code && game.room.round === round);
+  const gameDone = !!(roomData && round > 0 && gameIsDone(roomData.meta, roomData.players, roomData.coop));
+  const activeGame = round > 0 && !gameDone;
+  const endedNow = !!(rmeta && round > 0 && (rmeta.endedRound || 0) >= round);
+  // Custom co-op: after a game ends or is skipped, one player at a time gives the next pairing.
+  const pending = rmeta && rmeta.pending && round > 0 && rmeta.pending.forRound === round ? rmeta.pending : null;
+  const pendingMine = !!(pending && pending.pickerId === pid.current);
+  const showPairing = !!(pending && pairingHidden !== round);
+  const meRec = liveList.find((p) => p.id === pid.current) || myRec.current;
+  const iVoted = !!(meRec && round > 0 && meRec.nextVote === round);
+  const voteCount = liveList.filter((p) => p.nextVote === round).length;
+  const readyText = (() => {
+    if (!iVoted) return "";
+    const waiting = liveList.filter((p) => p.nextVote !== round);
+    if (!waiting.length) return pending ? "Everyone is ready. Waiting for the next pairing…" : "Everyone is ready. Starting the next game…";
+    const inLobby = waiting.filter((p) => !p.inGame);
+    if (inLobby.length === waiting.length) return `${waiting.length === 1 ? "Partner is" : "Other players are"} in the lobby ${voteCount}/${liveList.length}`;
+    return `Waiting for ${waiting.length === 1 ? "partner" : `${waiting.length} other players`}… ${voteCount}/${liveList.length}`;
+  })();
+  // Reveal Link: everyone in the room has to tap it before the shortest link is shown to all.
+  const iRevealed = !!(meRec && round > 0 && meRec.revealVote === round);
+  const revealCount = liveList.filter((p) => p.revealVote === round).length;
+  const revealedNow = round > 0 && liveList.length > 0 && revealCount === liveList.length;
+  const revealText = (() => {
+    if (!iRevealed || revealedNow) return "";
+    const waiting = liveList.filter((p) => p.revealVote !== round);
+    if (waiting.every((p) => !p.inGame)) return `${waiting.length === 1 ? "Partner is" : "Other players are"} in the lobby ${revealCount}/${liveList.length}`;
+    return `Waiting for ${waiting.length === 1 ? "partner" : `${waiting.length} other players`}… ${revealCount}/${liveList.length}`;
+  })();
+  // The answer screen: solo daily games open it from "Reveal Link"; rooms open it once everyone has tapped it.
+  const answerOn = !!(game && ((!game.room && game.revealed) || (game.room && game.room.round === round && revealedNow)));
+  useEffect(() => {
+    if (!answerOn) { setAnswer(null); return; }
+    const la = toLocalId(game.a), lb = toLocalId(game.b);
+    if (!la || !lb) { setAnswer({ unavailable: true }); return; }
+    const sol = solveLocal(la, lb, cameos);
+    if (!sol) { setAnswer({ none: true }); return; }
+    setAnswer({ movies: sol.films, nodes: sol.ids.map((id, i) => (i % 2 === 0 ? { type: "actor", ...localActor(id) } : { type: "movie", ...localMovie(id) })) });
+  }, [answerOn, game && game.a.id, game && game.b.id]);
+  const showAnswer = answerOn && !(game.room && answerHidden === round);
+  const raceRows = board ? [...board.fin].sort((a, b) => a.movies - b.movies || a.doneAt - b.doneAt) : [];
+  const coopMovies = roomData && roomData.coop && roomData.coop.round === round ? roomData.coop.chain.filter((n) => n.type === "movie").length : 0;
+  const doneSummary = !gameDone || !rmeta ? "" : endedNow ? `${rmeta.endedBy || "Someone"} ended this game.` : revealedNow ? "The shortest link was revealed." : rmeta.mode === "coop"
+    ? `Linked together in ${coopMovies} movie${coopMovies === 1 ? "" : "s"}.`
+    : raceRows.length ? `${raceRows[0].name} won with ${raceRows[0].movies} movie${raceRows[0].movies === 1 ? "" : "s"}.` : "";
+  const statusOf = (p) => {
+    if (round > 0 && p.nextVote === round) return "Ready for the next game";
+    if (round > 0 && rmeta && rmeta.mode === "race" && p.round === round && p.done) return `Finished in ${p.movies} movie${p.movies === 1 ? "" : "s"}`;
+    if (round > 0 && p.round === round && p.inGame) return "In the game";
+    return "In the lobby";
+  };
+  const statusLead = (p) => (round > 0 && p.nextVote === round ? "✅" : round > 0 && p.round === round && p.inGame ? "🎬" : "🍿");
+  const partnerLines = (() => {
+    if (!game || !game.room || !room) return [];
+    const r = game.room.round;
+    return liveList.filter((p) => p.id !== pid.current).map((p) => {
+      if (game.room.mode === "coop") return `${p.name} ${p.inGame && p.round === r ? "is on the board" : "is in the lobby"}`;
+      if (p.round === r && p.done) return `${p.name} finished in ${p.movies} movie${p.movies === 1 ? "" : "s"}!`;
+      if (p.round === r && p.inGame) return `${p.name} is racing: ${p.movies} movie${p.movies === 1 ? "" : "s"} so far`;
+      return `${p.name} is in the lobby`;
+    });
+  })();
 
-  // ── Co-op turns, shared-board writes, race scorecard
+  // ── Actions: ready-up, skip, lobby
+  const voteNext = async () => { if (!room || !round) return; await writeMe({ nextVote: round }); };
+  const revealLink = async () => {
+    if (!room || !round) return;
+    await writeMe({ revealVote: round });
+    notify("Reveal requested. The link shows once everyone taps Reveal Link.");
+  };
+  const exitToLobby = async () => { setWinOpen(false); setResults(null); setAnswerHidden(round); setTab("rooms"); await writeMe({ inGame: false }); };
+  const backToGame = async () => { setAnswerHidden(0); await writeMe({ inGame: true }); setTab("play"); };
+  const setPicker = async (id) => {
+    if (!room || !rmeta || !rmeta.pending) return;
+    const nm = (liveList.find((p) => p.id === id) || {}).name || "Someone";
+    const meta = { ...rmeta, pending: { ...rmeta.pending, pickerId: id, pickerName: nm } };
+    setRoomData((d) => (d ? { ...d, meta } : d));
+    await kv.set("room:" + room.code, meta);
+  };
+  const submitPairing = async () => {
+    const pr = await resolvePair();
+    if (!pr) return;
+    const ok = await startRound("custom", pr[0], pr[1], "coop", { force: true, expectRound: round });
+    if (ok) { setAText(""); setBText(""); setPickA(null); setPickB(null); }
+  };
+  // Ends the live game for everyone so a fresh one can start right away.
+  const endGame = async () => {
+    if (!room || !rmeta || !round) return;
+    const who = (myRec.current && myRec.current.name) || rname.trim() || "Someone";
+    const meta = { ...rmeta, endedRound: round, endedBy: who, endedById: pid.current };
+    setConfirmEnd(false);
+    endedSeen.current = round;
+    setRoomData((d) => (d ? { ...d, meta } : d));
+    setGame((g) => (g && g.room && g.room.round <= round ? null : g));
+    setWinOpen(false); setResults(null);
+    await kv.set("room:" + room.code, meta);
+    await writeMe({ inGame: false, nextVote: 0, skip: false });
+    notify("Game ended. Start a fresh one!");
+  };
+  const setRule = (key, val) => {
+    (key === "cameos" ? setCameos : setHints)(val);
+    ruleStamp.current = Date.now();
+    if (room && roomData && roomData.meta) {
+      const meta = { ...roomData.meta, [key]: val };
+      setRoomData((d) => (d ? { ...d, meta } : d));
+      kv.set("room:" + room.code, meta);
+    }
+  };
+
   gameRef.current = game;
-  const coopMode = !!(game && game.room && game.room.mode === "coop");
-  const livePids = useMemo(() => new Set(roomData ? livePlayers(roomData.players).map((p) => p.id) : []), [roomData]);
-  const turnId = coopMode && coopOrder.length ? coopOrder[(chainLen - 1) % coopOrder.length] : null;
-  const myTurn = !coopMode || !turnId || turnId === pid.current || !livePids.has(turnId);
-  const turnP = roomData && turnId ? roomData.players.find((p) => p.id === turnId) : null;
-  const turnName = turnP ? turnP.name : "your teammate";
-  const teamPlayers = useMemo(() => {
-    if (!roomData) return [];
-    const idx = (id) => { const i = coopOrder.indexOf(id); return i < 0 ? 99 : i; };
-    return livePlayers(roomData.players).sort((a, b) => idx(a.id) - idx(b.id));
-  }, [roomData, coopOrder]);
-
+  // When everybody is ready, the player with the lowest id starts the next game and the rest hop in.
   useEffect(() => {
-    if (!game || !game.room || game.room.mode !== "coop" || !room) return;
-    const sig = sigOf(game.chain, game.won);
-    if (sig === coopSig.current) return;
-    const ver = coopVer.current + 1;
-    coopVer.current = ver; coopSig.current = sig;
-    kv.set("rc:" + room.code, { round: game.room.round, ver, order: coopOrder, chain: game.chain.map(packNode), won: !!game.won, by: pid.current });
-  }, [chainLen, won, gameRound]);
-
+    if (!room || !rmeta || !round || liveList.length === 0) return;
+    if (!liveList.every((p) => p.nextVote === round)) return;
+    const leader = [...liveList].sort((a, b) => (a.id < b.id ? -1 : 1))[0];
+    if (leader.id !== pid.current || startingRef.current === round) return;
+    startingRef.current = round;
+    if (rmeta.mode === "coop" && rmeta.kind === "custom") {
+      const ids = liveList.map((p) => p.id).sort();
+      const nextId = ids[(ids.indexOf(rmeta.startedById) + 1) % ids.length];
+      const nm = (liveList.find((p) => p.id === nextId) || {}).name || "Someone";
+      const meta = { ...rmeta, pending: { forRound: round, pickerId: nextId, pickerName: nm } };
+      setRoomData((d) => (d ? { ...d, meta } : d));
+      kv.set("room:" + room.code, meta);
+      return;
+    }
+    const idx = rmeta.a && rmeta.b ? ladder.findIndex((r) => r.a === rmeta.a.id && r.b === rmeta.b.id) : -1;
+    const row = ladder[(idx + 1) % ladder.length];
+    startRound("daily", localActor(row.a), localActor(row.b), rmeta.mode || "race", { force: true, expectRound: round });
+  }, [roomData]);
   useEffect(() => {
-    if (!board || !rmeta || rmeta.mode === "coop" || board.r === 0) return;
-    if (board.run.length > 0 || board.fin.length + board.run.length < 2) return;
+    if (!room || !rmeta || !rmeta.a || !round) return;
+    const me = myRec.current;
+    if (!me || !me.nextVote || me.nextVote >= round || joinedRound.current >= round) return;
+    joinedRound.current = round;
+    joinBoard(room.code, rmeta);
+  }, [rmeta && rmeta.round]);
+  // If whoever should give the pairing has left, the room leader takes over.
+  useEffect(() => {
+    if (!pending || !room || liveList.some((p) => p.id === pending.pickerId)) return;
+    const leader = [...liveList].sort((a, b) => (a.id < b.id ? -1 : 1))[0];
+    if (leader && leader.id === pid.current) setPicker(pid.current);
+  }, [roomData]);
+  // Race scorecard once every racer has finished
+  useEffect(() => {
+    if (!board || !rmeta || rmeta.mode !== "race" || board.r === 0) return;
+    if (board.fin.length === 0 || board.run.length > 0 || board.idle.length > 0) return;
     if (shownRound.current === board.r) return;
     if (!board.fin.some((p) => p.id === pid.current)) return;
     shownRound.current = board.r;
     const rows = [...board.fin].sort((a, b) => a.movies - b.movies || a.doneAt - b.doneAt);
     const tie = rows.length > 1 && rows[0].movies === rows[1].movies;
     setWins((w) => ({ ...w, [rows[0].id]: { name: rows[0].name, n: ((w[rows[0].id] || {}).n || 0) + 1 } }));
-    setScorecard({ round: board.r, rows, tie });
+    setResults({ round: board.r, rows, tie });
     setWinOpen(false);
   }, [board]);
-  useEffect(() => { if (scorecard && rmeta && (rmeta.round || 0) > scorecard.round) setScorecard(null); }, [rmeta && rmeta.round]);
+  useEffect(() => { if (results && round > results.round) setResults(null); }, [round]);
+  useEffect(() => { setConfirmEnd(false); }, [round]);
   const nextDaily = () => {
     if (!game || !game.daily) return;
     const i = ladder.findIndex((r) => r.a === game.daily.a && r.b === game.daily.b);
@@ -1283,15 +1634,31 @@ export default function App() {
     setWinOpen(false);
     launch(localActor(row.a), localActor(row.b), null, null, { a: row.a, b: row.b });
   };
-  const nextChallenge = () => {
-    const m = rmeta; if (!m) return;
-    const idx = m.a && m.b ? ladder.findIndex((r) => r.a === m.a.id && r.b === m.b.id) : -1;
-    const row = ladder[(idx + 1) % ladder.length];
-    setScorecard(null);
-    startRound("daily", localActor(row.a), localActor(row.b), m.mode || "race");
-  };
 
-  // Custom-mode actor search
+  // Custom pair: players type actor names freely, with no suggestion lists. The closest name is
+  // matched when they press Enter, leave the box, or start the game, and the portrait confirms it.
+  const setText = (k, v) => {
+    if (k === "a") { setAText(v); setPickA(null); } else { setBText(v); setPickB(null); }
+  };
+  const resolveField = async (k) => {
+    const cur = k === "a" ? pickA : pickB;
+    if (cur) return cur;
+    const text = (k === "a" ? aText : bText).trim();
+    if (text.length < 2) return null;
+    try {
+      const hit = (await api.searchActors(text))[0] || null;
+      if (hit) { if (k === "a") { setPickA(hit); setAText(hit.name); } else { setPickB(hit); setBText(hit.name); } }
+      return hit;
+    } catch (e) { failApi(); return null; }
+  };
+  const resolvePair = async () => {
+    const [A, B] = await Promise.all([resolveField("a"), resolveField("b")]);
+    if (!A) { notify(aText.trim().length < 2 ? "Type the starting actor first." : `Couldn’t find “${aText.trim()}”. Check the spelling.`); return null; }
+    if (!B) { notify(bText.trim().length < 2 ? "Type the target actor first." : `Couldn’t find “${bText.trim()}”. Check the spelling.`); return null; }
+    if (A.id === B.id) { notify("Pick two different stars!"); return null; }
+    return [A, B];
+  };
+  // Custom tab: tap a box, search for an actor, tap a suggestion to fill it.
   useEffect(() => {
     if (cq.trim().length < 2) { setCres([]); return undefined; }
     let live = true;
@@ -1299,12 +1666,12 @@ export default function App() {
     return () => { live = false; clearTimeout(t); };
   }, [cq, api]);
   const fillSlot = (a) => {
-    if (slot === "a") { setPickA(a); if (!pickB) setSlot("b"); } else { setPickB(a); if (!pickA) setSlot("a"); }
-    setCq(""); setCres([]); setLink("");
+    if (slot === "a") { setPickA(a); setAText(a.name); if (!pickB) setSlot("b"); } else { setPickB(a); setBText(a.name); if (!pickA) setSlot("a"); }
+    setCq(""); setCres([]);
   };
   const shuffle = () => {
     const i = Math.floor(Math.random() * STARS.length); let j = Math.floor(Math.random() * STARS.length); if (j === i) j = (j + 1) % STARS.length;
-    setPickA(localActor(STARS[i])); setPickB(localActor(STARS[j])); setLink("");
+    setPickA(localActor(STARS[i])); setPickB(localActor(STARS[j])); setAText(ACTORS[STARS[i]].name); setBText(ACTORS[STARS[j]].name);
   };
 
   const ladder = useMemo(() => {
@@ -1316,7 +1683,6 @@ export default function App() {
   const diffColor = { Easy: [C.teal, C.cream], Medium: [C.marigold, C.ink], Hard: [C.crimson, C.cream] };
   const used = useMemo(() => new Set(game ? game.chain.map((n) => n.id) : []), [game]);
   const movieCount = game ? game.chain.filter((n) => n.type === "movie").length : 0;
-  const status = apiKey ? ({ ok: "Live TMDB", fail: "Key saved, TMDB unreachable", checking: "Checking key…", idle: "Key saved" }[tmdbState]) : "Built-in reel";
 
   const ChallengeRow = ({ row, i }) => {
     const A = localActor(row.a), B = localActor(row.b); const [bg, fg] = diffColor[row.diff];
@@ -1336,38 +1702,45 @@ export default function App() {
     );
   };
 
-  const Slot = ({ k, val }) => (
-    <button onClick={() => setSlot(k)} className="flex-1 rounded-2xl flex flex-col items-center py-3 px-2" style={{ background: C.cream, border: `3px solid ${slot === k ? C.pink : C.purple}`, boxShadow: slot === k ? `0 0 0 3px ${C.marigold}, 3px 4px 0 3px ${C.purple}` : `3px 4px 0 ${C.purple}` }}>
-      {val ? <Portrait item={val} size={62} ring={k === "a" ? C.marigold : C.pink} ring2={k === "a" ? C.teal : C.marigold} /> : <div className="flex items-center justify-center rounded-full" style={{ width: 62, height: 62, border: `3px dashed ${C.purple}` }}><Reel size={30} color={C.cream} fill={C.teal} /></div>}
-      <div className="mt-2 font-bold text-center" style={{ fontSize: 13, color: C.ink, lineHeight: 1.15, minHeight: 30 }}>{val ? val.name : k === "a" ? "Pick the start" : "Pick the target"}</div>
-    </button>
-  );
-
+  const slotBox = (k) => {
+    const val = k === "a" ? pickA : pickB;
+    return (
+      <button onClick={() => setSlot(k)} className="flex-1 rounded-2xl flex flex-col items-center py-3 px-2" style={{ background: C.cream, border: `3px solid ${slot === k ? C.pink : C.purple}`, boxShadow: slot === k ? `0 0 0 3px ${C.marigold}, 3px 4px 0 3px ${C.purple}` : `3px 4px 0 ${C.purple}` }}>
+        {val
+          ? <Portrait item={val} size={62} ring={k === "a" ? C.marigold : C.pink} ring2={k === "a" ? C.teal : C.marigold} />
+          : <div className="flex items-center justify-center rounded-full" style={{ width: 62, height: 62, border: `3px dashed ${C.purple}` }}><Reel size={30} color={C.cream} fill={C.teal} /></div>}
+        <div className="mt-2 font-bold text-center" style={{ fontSize: 13, color: C.ink, lineHeight: 1.15, minHeight: 30 }}>{val ? val.name : k === "a" ? "Pick the start" : "Pick the target"}</div>
+      </button>
+    );
+  };
   const tabs = [["daily", "Daily", CalendarDays], ["custom", "Custom", Users], ["rooms", "Rooms", Ticket]];
 
   return (
-    <div className="fsl w-full flex justify-center" style={{ background: C.ink, minHeight: "100dvh" }}>
+    <div className="fsl" style={{ background: C.ink, width: "100%", height: "100dvh", overflow: "hidden", position: "relative" }}>
       <style>{CSS}</style>
-      <div className="relative w-full max-w-md overflow-hidden flex flex-col" style={{ height: "100dvh", background: GRAD, fontFamily: BODY, color: C.ink }}>
+      <div className={`relative overflow-hidden flex flex-col ${layout.wide ? "fsl-wide" : layout.mid ? "fsl-mid" : ""}`} style={{ width: `${100 / layout.s}%`, height: `${100 / layout.s}%`, transform: layout.s === 1 ? undefined : `scale(${layout.s})`, transformOrigin: "0 0", background: GRAD, fontFamily: BODY, color: C.ink }}>
         <div aria-hidden className="absolute inset-0 pointer-events-none" style={{ backgroundImage: RAYS }} />
 
         {/* top nav */}
-        <div className="relative z-30 flex items-center justify-between px-4" style={{ paddingTop: "max(env(safe-area-inset-top), 10px)", paddingBottom: 8 }}>
-          <div className="flex items-center gap-3">
-            <Reel size={42} spin color={C.marigold} />
-            <div>
-              <div style={{ ...markStyle(6), fontSize: 27 }}>FILMY</div>
-              <div style={{ ...markStyle(4), fontSize: 16, marginTop: 3 }}>SNEAKY LINK</div>
+        <div className="relative z-30" style={{ paddingTop: "max(env(safe-area-inset-top), 10px)", paddingBottom: 8 }}>
+          <div className="fsl-col flex items-center justify-between px-4">
+            <div className="flex items-center gap-3">
+              <Reel size={42} spin color={C.marigold} />
+              <div>
+                <div style={{ ...markStyle(6), fontSize: 27 }}>FILMY</div>
+                <div style={{ ...markStyle(4), fontSize: 16, marginTop: 3 }}>SNEAKY LINK</div>
+              </div>
+            </div>
+            <div className="flex flex-col gap-2">
+                <MiniToggle label="Hints" aria="Dropdown hints" on={hints} onChange={(v) => setRule("hints", v)} />
             </div>
           </div>
-          <button onClick={() => { setDraft(store.get("fsl:key") || ""); setDrawer(true); }} aria-label="Open settings" className="rounded-full flex items-center justify-center" style={{ width: 46, height: 46, background: C.cream, border: `3px solid ${C.purple}`, boxShadow: `inset 0 0 0 2px ${C.cream}, inset 0 0 0 4px ${C.teal}, 2px 3px 0 ${C.purple}` }}>
-            <SettingsIcon size={22} color={C.purple} />
-          </button>
         </div>
 
         <main className="relative z-10 flex-1 overflow-y-auto" style={{ WebkitOverflowScrolling: "touch", overscrollBehavior: "contain" }}>
+          <div className="fsl-col">
           {tab !== "play" && game && (
-            <div className="px-3 pt-2">
+            <div className="fsl-narrow px-3 pt-2">
               <button onClick={() => setTab("play")} className="w-full rounded-xl py-2 px-3 flex items-center justify-center gap-2" style={{ ...btn(C.purple), fontSize: 13 }}>
                 <Clapperboard size={16} className="shrink-0" /> {game.won ? "See your finished link" : `Resume ${game.a.name} to ${game.b.name}`}
               </button>
@@ -1377,7 +1750,7 @@ export default function App() {
           {/* DAILY */}
           {tab === "daily" && (
             <div className="px-3 pb-6 pt-2">
-              <PopCard tone={C.purple} ring={C.marigold} className="overflow-hidden" style={{ boxShadow: `inset 0 0 0 3px ${C.purple}, inset 0 0 0 5px ${C.marigold}, 4px 5px 0 ${C.film}` }}>
+              <PopCard tone={C.purple} ring={C.marigold} className="overflow-hidden" style={{ maxWidth: "34rem", marginLeft: "auto", marginRight: "auto", boxShadow: `inset 0 0 0 3px ${C.purple}, inset 0 0 0 5px ${C.marigold}, 4px 5px 0 ${C.film}` }}>
                 <Scallop color={C.pink} size={18} />
                 <div className="px-4 pt-2 pb-4 text-center">
                   <div style={{ fontFamily: DISPLAY, fontSize: 18, color: C.marigold }}>Today’s pick</div>
@@ -1392,56 +1765,43 @@ export default function App() {
                 </div>
               </PopCard>
               <div className="mt-5 mb-2 px-1" style={{ ...markStyle(4), fontSize: 20, color: C.cream, WebkitTextStroke: `4px ${C.purple}`, textShadow: `2px 3px 0 ${C.purple}` }}>Challenges</div>
-              <div className="space-y-3">{ladder.map((row, i) => <ChallengeRow key={row.a + row.b} row={row} i={i} />)}</div>
+              <div className="fsl-grid2">{ladder.map((row, i) => <ChallengeRow key={row.a + row.b} row={row} i={i} />)}</div>
               <p className="mt-4 px-1" style={{ fontSize: 12, color: C.film, fontWeight: 700 }}>Par is the shortest chain in the built-in reel, with cameos {cameos ? "counted" : "excluded"}.</p>
             </div>
           )}
 
           {/* CUSTOM */}
           {tab === "custom" && (
-            <div className="px-3 pb-6 pt-2">
+            <div className="fsl-narrow px-3 pb-6 pt-2">
               <PopCard className="p-3">
                 <div className="flex items-center justify-between">
                   <div style={{ fontFamily: DISPLAY, fontSize: 17, color: C.purple }}>Play with friends</div>
                   <button onClick={shuffle} aria-label="Random pair" className="rounded-full flex items-center justify-center" style={{ width: 38, height: 38, ...btn(C.teal) }}><Shuffle size={17} /></button>
                 </div>
-                <div className="mt-3 flex items-stretch gap-2"><Slot k="a" val={pickA} /><div className="flex items-center"><Reel size={26} spin color={C.marigold} /></div><Slot k="b" val={pickB} /></div>
+                <div className="mt-3 flex items-stretch gap-2">{slotBox("a")}<div className="flex items-center"><Reel size={26} spin color={C.marigold} /></div>{slotBox("b")}</div>
                 <div className="mt-3 flex items-center gap-2 rounded-xl px-3" style={{ background: "#fff", border: `3px solid ${C.teal}`, height: 50 }}>
                   <Search size={19} color={C.teal} />
-                  <input value={cq} onChange={(e) => setCq(e.target.value)} placeholder={slot === "a" ? "Search the starting actor…" : "Search the target actor…"} className="flex-1 min-w-0 bg-transparent outline-none font-bold" style={{ fontSize: 16, color: C.ink }} autoComplete="off" spellCheck={false} />
+                  <input value={cq} onChange={(e) => setCq(e.target.value)} placeholder={slot === "a" ? "Search the starting actor…" : "Search the target actor…"} aria-label="Search actors" className="flex-1 min-w-0 bg-transparent outline-none font-bold" style={{ fontSize: 16, color: C.ink }} autoComplete="off" spellCheck={false} />
                 </div>
                 {cres.length > 0 && <div className="mt-2 rounded-xl overflow-y-auto" style={{ maxHeight: 280, background: C.cream, border: `2px solid ${C.purple}` }}>{cres.map((a) => <Row key={a.id} item={a} type="actor" onClick={() => fillSlot(a)} />)}</div>}
-                {cq.trim().length >= 2 && cres.length === 0 && <div className="mt-2" style={{ fontSize: 13 }}>No matches yet. {api.kind === "local" ? "Add a TMDB key in Settings to search every actor." : ""}</div>}
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {STARS.slice(0, 14).map((id) => (
-                    <button key={id} onClick={() => fillSlot(localActor(id))} className="rounded-full px-3 py-1 font-bold" style={{ background: C.cream, color: C.purple, border: `2px solid ${C.purple}`, fontSize: 12 }}>{ACTORS[id].name.split(" ")[0]}</button>
-                  ))}
-                </div>
+                {cq.trim().length >= 2 && cres.length === 0 && <div className="mt-2" style={{ fontSize: 13 }}>No matches yet. {api.kind === "local" ? "The built-in reel doesn’t have that actor yet." : ""}</div>}
                 <div className="mt-4 grid grid-cols-1 gap-3">
-                  <button onClick={() => pickA && pickB ? launch(pickA, pickB) : notify("Pick a start and a target star first.")} disabled={launching} className="rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.teal), fontSize: 15 }}><Play size={18} /> Play this pair</button>
-                  <button onClick={sendChallenge} className="rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.pink), fontSize: 15 }}><Send size={18} /> Send Sneaky Link Challenge</button>
-                  {room && <button onClick={() => (pickA && pickB ? startRound("custom", pickA, pickB) : notify("Pick a start and a target star first."))} disabled={launching} className="rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.purple), fontSize: 15 }}><Ticket size={18} /> Start {roomMode === "coop" ? "co-op" : "race"} in room {room.code}</button>}
-                </div>
-                <div className="mt-2" style={{ fontSize: 12, color: C.ink }}>Sending opens a private co-op room for this pair. Your friend lands on the shared board straight from the link. Rules: cameos {cameos ? "on" : "off"}, hints {hints ? "on" : "off"}.</div>
-                {link && (
-                  <div className="mt-2 flex items-center gap-2 rounded-xl px-3 py-2" style={{ background: "#fff", border: `2px dashed ${C.purple}` }}>
-                    <div className="flex-1 min-w-0 break-all" style={{ fontSize: 11, color: C.teal, fontWeight: 700 }}>{link}</div>
-                    <button onClick={async () => notify((await copyText(link)) ? "Link copied!" : "Couldn’t copy.")} aria-label="Copy link"><Copy size={18} color={C.purple} /></button>
+                  <button onClick={async () => { const pr = await resolvePair(); if (pr) launch(pr[0], pr[1]); }} disabled={launching} className="rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.teal), fontSize: 15 }}><Play size={18} /> Play this pair</button>
                   </div>
-                )}
+                <div className="mt-2" style={{ fontSize: 12, color: C.ink }}>This plays on your device. For multiplayer, create a room in the Rooms tab. Cameos are always on. Hints {hints ? "on" : "off"}.</div>
               </PopCard>
             </div>
           )}
 
           {/* ROOMS */}
           {tab === "rooms" && (
-            <div className="px-3 pb-6 pt-2 space-y-4">
+            <div className={`${room ? "fsl-rooms" : "fsl-narrow"} px-3 pb-6 pt-2 space-y-4`}>
               {!room ? (
                 <PopCard className="overflow-hidden">
                   <Scallop color={C.pink} size={18} />
                   <div className="px-4 pt-2 pb-4">
                     <div style={{ fontFamily: DISPLAY, fontSize: 18, color: C.purple }}>Multiplayer rooms</div>
-                    <div className="mt-1" style={{ fontSize: 14, lineHeight: 1.25 }}>Race your friends to link the same two stars. Fewest movies wins the bragging rights.</div>
+                    <div className="mt-1" style={{ fontSize: 14, lineHeight: 1.25 }}>Play together on one board, or race head-to-head. One game at a time, and everyone in the room can jump in.</div>
                     <div className="mt-3 flex items-center gap-2 rounded-xl px-3" style={{ background: "#fff", border: `3px solid ${C.teal}`, height: 50 }}>
                       <Users size={19} color={C.teal} />
                       <input value={rname} onChange={(e) => setRname(e.target.value.slice(0, 16))} placeholder="Your name" className="flex-1 min-w-0 bg-transparent outline-none font-bold" style={{ fontSize: 16, color: C.ink }} autoComplete="off" spellCheck={false} />
@@ -1465,7 +1825,7 @@ export default function App() {
                     <Scallop color={C.pink} size={18} />
                     <div className="px-4 pt-1 pb-4 text-center">
                       <div style={{ ...markStyle(6), fontSize: 46, letterSpacing: "0.12em" }}>{room.code}</div>
-                      <div className="mt-2 font-bold" style={{ fontSize: 13, color: C.teal }}>{board ? board.count : 1} player{board && board.count !== 1 ? "s" : ""} in the room. Share this code!</div>
+                      <div className="mt-2 font-bold" style={{ fontSize: 13, color: C.teal }}>Share this code with your co-star!</div>
                       <div className="mt-3 flex gap-2 justify-center">
                         <button onClick={async () => notify((await copyText(`🎞️ Join my Filmy Sneaky Link room! Code: ${room.code}\n${baseUrl()}?room=${room.code}`)) ? "Invite copied. Paste it in your chat!" : "Couldn’t copy.")} className="rounded-xl px-4 py-2 flex items-center gap-2" style={{ ...btn(C.teal), fontSize: 13 }}><Copy size={16} /> Copy invite</button>
                         <button onClick={leaveRoom} className="rounded-xl px-4 py-2 flex items-center gap-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}><LogOut size={16} /> Leave</button>
@@ -1473,9 +1833,17 @@ export default function App() {
                     </div>
                   </PopCard>
 
-                  {rmeta && rmeta.round > 0 && rmeta.a && (
-                    <PopCard className="p-3 text-center" tone={C.cream}>
-                      <div style={{ fontFamily: DISPLAY, fontSize: 16, color: C.purple }}>Match {rmeta.round} is on! {rmeta.mode === "coop" ? "Co-op" : "Race"}</div>
+                  <PopCard className="p-3">
+                    <div style={{ fontFamily: DISPLAY, fontSize: 16, color: C.purple }}>In the room</div>
+                    <div className="mt-2 space-y-2">
+                      {liveList.map((p) => <BoardLine key={p.id} me={p.id === pid.current} lead={statusLead(p)} title={`${p.name}${p.id === pid.current ? " (you)" : ""}`} sub={statusOf(p)} />)}
+                    </div>
+                  </PopCard>
+
+                  {rmeta && round > 0 && rmeta.a && (
+                    <PopCard className="p-3 text-center">
+                      <div style={{ fontFamily: DISPLAY, fontSize: 16, color: C.purple }}>{endedNow ? `Game ${round} ended` : gameDone ? `Game ${round} finished` : `Game ${round} is live`}</div>
+                      <div className="mt-1 font-bold" style={{ fontSize: 12, color: C.teal }}>{rmeta.mode === "coop" ? "Co-op: one shared board" : "Head-to-head race: private boards"}</div>
                       <div className="mt-2 flex items-center justify-center gap-3">
                         <Portrait item={roomActor(rmeta.a)} size={56} />
                         <Reel size={24} spin color={C.marigold} />
@@ -1483,58 +1851,68 @@ export default function App() {
                       </div>
                       <div className="mt-2 font-bold" style={{ fontSize: 14, lineHeight: 1.2 }}>{rmeta.a.name} to {rmeta.b.name}</div>
                       <div style={{ fontSize: 12, color: C.teal, fontWeight: 700 }}>Started by {rmeta.startedBy}. Cameos {rmeta.cameos ? "on" : "off"}, hints {rmeta.hints ? "on" : "off"}.</div>
-                      {inMatch ? (
-                        <button onClick={() => setTab("play")} className="mt-3 rounded-xl px-5 py-2" style={{ ...btn(C.teal), fontSize: 14 }}>{rmeta.mode === "coop" ? "Back to the shared board" : "Back to my chain"}</button>
-                      ) : (
-                        <button onClick={joinRound} disabled={launching} className="mt-3 rounded-xl px-5 py-2 inline-flex items-center gap-2" style={{ ...btn(C.pink), fontSize: 14 }}><Play size={16} /> {rmeta.mode === "coop" ? "Join the board" : "Join the race"}</button>
+                      {gameDone && doneSummary && <div className="mt-2 font-bold" style={{ fontSize: 14, color: C.purple }}>{doneSummary}</div>}
+                      {activeGame && (
+                        <div className="mt-3 grid grid-cols-1 gap-2">
+                          {inMatch
+                            ? <button onClick={backToGame} className="rounded-xl py-2 inline-flex items-center justify-center gap-2" style={{ ...btn(C.teal), fontSize: 14 }}><Play size={16} /> Back to the game</button>
+                            : <button onClick={joinRound} disabled={launching} className="rounded-xl py-2 inline-flex items-center justify-center gap-2" style={{ ...btn(C.pink), fontSize: 14 }}><Play size={16} /> Join the game</button>}
+                          {confirmEnd ? (
+                            <div className="grid grid-cols-2 gap-2">
+                              <button onClick={endGame} className="rounded-xl py-2" style={{ ...btn(C.crimson), fontSize: 13 }}>Yes, end it</button>
+                              <button onClick={() => setConfirmEnd(false)} className="rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}>Keep playing</button>
+                            </div>
+                          ) : (
+                            <button onClick={() => setConfirmEnd(true)} className="rounded-xl py-2" style={{ ...btn(C.crimson), fontSize: 13 }}>End Game</button>
+                          )}
+                        </div>
+                      )}
+                      {gameDone && (
+                        <div className="mt-3 grid grid-cols-1 gap-2">
+                          {!endedNow && <button onClick={voteNext} disabled={iVoted} className="rounded-xl py-2" style={{ ...btn(iVoted ? C.teal : C.pink), fontSize: 14 }}>{iVoted ? "Ready ✓" : "Next Game"}</button>}
+                          {!showPicker && !endedNow && <button onClick={() => setShowPicker(true)} className="rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}>Pick a different game</button>}
+                        </div>
+                      )}
+                      {readyText && <div className="mt-2 font-bold" style={{ fontSize: 13, color: C.teal }}>{readyText}</div>}
+                      {pending && (
+                        <div className="mt-2">
+                          <div className="font-bold" style={{ fontSize: 13, color: C.purple }}>{pendingMine ? "It’s your turn to give the next pairing." : `Waiting for ${pending.pickerName} to give the pairing…`}</div>
+                          {pendingMine && pairingHidden === round && <button onClick={() => setPairingHidden(0)} className="mt-2 rounded-xl px-4 py-2" style={{ ...btn(C.pink), fontSize: 13 }}>Give pairing</button>}
+                          {!pendingMine && <button onClick={() => setPicker(pid.current)} className="mt-2 rounded-xl px-4 py-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}>Pick it myself</button>}
+                        </div>
                       )}
                     </PopCard>
                   )}
 
-                  <PopCard className="p-3">
-                    <div style={{ fontFamily: DISPLAY, fontSize: 16, color: C.purple }}>Start a showdown</div>
-                    <div className="mt-3 grid grid-cols-2 gap-2">
-                      {[["coop", "Play together", "One shared board. Take turns."], ["race", "Head-to-head", "Private boards. Lowest link wins."]].map(([k, t, d]) => (
-                        <button key={k} onClick={() => setRoomMode(k)} aria-pressed={roomMode === k} className="rounded-xl px-2 py-2 text-left" style={{ background: roomMode === k ? C.pink : C.cream, color: roomMode === k ? C.cream : C.purple, border: `3px solid ${C.purple}`, boxShadow: roomMode === k ? `3px 4px 0 ${C.purple}` : "none" }}>
-                          <div style={{ fontFamily: DISPLAY, fontSize: 14 }}>{t}</div>
-                          <div style={{ fontSize: 12, lineHeight: 1.2, fontWeight: 700 }}>{d}</div>
-                        </button>
-                      ))}
-                    </div>
-                    <div className="mt-3 grid grid-cols-1 gap-3">
-                      <button onClick={() => startRound("daily", localActor(todays.a), localActor(todays.b))} disabled={launching} className="rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.pink), fontSize: 14 }}><CalendarDays size={17} /> {roomMode === "coop" ? "Co-op on today’s daily" : "Race today’s daily"}</button>
-                      <div className="pt-3" style={{ borderTop: `2px dashed ${C.purple}66` }}>
-                        <div style={{ fontFamily: DISPLAY, fontSize: 14, color: C.purple }}>Or choose your own stars</div>
-                        <div className="mt-2 flex items-stretch gap-2"><Slot k="a" val={pickA} /><div className="flex items-center"><Reel size={22} spin color={C.marigold} /></div><Slot k="b" val={pickB} /></div>
-                        <div className="mt-2 flex items-center gap-2 rounded-xl px-3" style={{ background: "#fff", border: `3px solid ${C.teal}`, height: 48 }}>
-                          <Search size={18} color={C.teal} />
-                          <input value={cq} onChange={(e) => setCq(e.target.value)} placeholder={slot === "a" ? "Search the starting actor…" : "Search the target actor…"} className="flex-1 min-w-0 bg-transparent outline-none font-bold" style={{ fontSize: 16, color: C.ink }} autoComplete="off" spellCheck={false} />
-                        </div>
-                        {cres.length > 0 && <div className="mt-2 rounded-xl overflow-y-auto" style={{ maxHeight: 240, background: C.cream, border: `2px solid ${C.purple}` }}>{cres.map((a) => <Row key={a.id} item={a} type="actor" onClick={() => fillSlot(a)} />)}</div>}
-                        <div className="mt-2 flex flex-wrap gap-2">
-                          {STARS.slice(0, 10).map((id) => (
-                            <button key={id} onClick={() => fillSlot(localActor(id))} className="rounded-full px-3 py-1 font-bold" style={{ background: C.cream, color: C.purple, border: `2px solid ${C.purple}`, fontSize: 12 }}>{ACTORS[id].name.split(" ")[0]}</button>
-                          ))}
-                        </div>
-                        <button onClick={() => (pickA && pickB ? startRound("custom", pickA, pickB) : notify("Pick a start and a target star first."))} disabled={launching} className="mt-3 w-full rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.purple), fontSize: 14 }}><Users size={17} /> Start custom {roomMode === "coop" ? "co-op" : "race"}</button>
-                      </div>
-                    </div>
-                    <div className="mt-2" style={{ fontSize: 12 }}>The match uses your Settings: cameos {cameos ? "on" : "off"}, hints {hints ? "on" : "off"}. Everyone who joins plays by the same rules.</div>
-                  </PopCard>
+                  {rmeta && rmeta.mode === "race" && activeGame && <PopCard className="p-3"><Scoreboard board={board} meId={pid.current} /></PopCard>}
 
-                  {rmeta && rmeta.mode === "coop" && rmeta.round > 0 ? (
+                  {(round === 0 || endedNow || (gameDone && showPicker)) && (
                     <PopCard className="p-3">
-                      <div style={{ fontFamily: DISPLAY, fontSize: 16, color: C.purple }}>Team chain</div>
-                      <div className="mt-2 space-y-2">
-                        {teamPlayers.map((p) => (
-                          <BoardLine key={p.id} me={p.id === pid.current} lead={coopMode && p.id === turnId ? "🎬" : "🍿"} title={`${p.name}${p.id === pid.current ? " (you)" : ""}`}
-                            sub={!coopMode ? "Join the board to play together" : p.id === turnId ? "Up next" : "Waiting for their turn"} />
+                      <div style={{ fontFamily: DISPLAY, fontSize: 16, color: C.purple }}>Start a game</div>
+                      <div className="mt-3 grid grid-cols-2 gap-2">
+                        {[["coop", "Play together", "One shared board. Anyone can add the next step."], ["race", "Head-to-head", "Private boards. Lowest link wins."]].map(([k, t, d]) => (
+                          <button key={k} onClick={() => setRoomMode(k)} aria-pressed={roomMode === k} className="rounded-xl px-2 py-2 text-left" style={{ background: roomMode === k ? C.pink : C.cream, color: roomMode === k ? C.cream : C.purple, border: `3px solid ${C.purple}`, boxShadow: roomMode === k ? `3px 4px 0 ${C.purple}` : "none" }}>
+                            <div style={{ fontFamily: DISPLAY, fontSize: 14 }}>{t}</div>
+                            <div style={{ fontSize: 12, lineHeight: 1.2, fontWeight: 700 }}>{d}</div>
+                          </button>
                         ))}
                       </div>
-                      {coopMode && <div className="mt-2 font-bold" style={{ fontSize: 13, color: C.teal }}>{movieCount} movie{movieCount === 1 ? "" : "s"} on the shared chain so far.</div>}
+                      <div className="mt-3 grid grid-cols-1 gap-3">
+                        <button onClick={() => startRound("daily", localActor(todays.a), localActor(todays.b))} disabled={launching} className="rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.pink), fontSize: 14 }}><CalendarDays size={17} /> {roomMode === "coop" ? "Co-op on today’s daily" : "Race today’s daily"}</button>
+                        <div className="pt-3" style={{ borderTop: `2px dashed ${C.purple}66` }}>
+                          <div style={{ fontFamily: DISPLAY, fontSize: 14, color: C.purple }}>Or choose your own stars</div>
+                          <div className="mt-2 flex items-stretch gap-2">{slotBox("a")}<div className="flex items-center"><Reel size={22} spin color={C.marigold} /></div>{slotBox("b")}</div>
+                          <div className="mt-2 flex items-center gap-2 rounded-xl px-3" style={{ background: "#fff", border: `3px solid ${C.teal}`, height: 48 }}>
+                            <Search size={18} color={C.teal} />
+                            <input value={cq} onChange={(e) => setCq(e.target.value)} placeholder={slot === "a" ? "Search the starting actor…" : "Search the target actor…"} aria-label="Search actors" className="flex-1 min-w-0 bg-transparent outline-none font-bold" style={{ fontSize: 16, color: C.ink }} autoComplete="off" spellCheck={false} />
+                          </div>
+                          {cres.length > 0 && <div className="mt-2 rounded-xl overflow-y-auto" style={{ maxHeight: 240, background: C.cream, border: `2px solid ${C.purple}` }}>{cres.map((a) => <Row key={a.id} item={a} type="actor" onClick={() => fillSlot(a)} />)}</div>}
+                          {cq.trim().length >= 2 && cres.length === 0 && <div className="mt-2" style={{ fontSize: 13 }}>No matches yet. {api.kind === "local" ? "The built-in reel doesn’t have that actor yet." : ""}</div>}
+                          <button onClick={async () => { const pr = await resolvePair(); if (pr) startRound("custom", pr[0], pr[1]); }} disabled={launching} className="mt-3 w-full rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.purple), fontSize: 14 }}><Users size={17} /> Start custom {roomMode === "coop" ? "co-op" : "race"}</button>
+                        </div>
+                      </div>
+                      <div className="mt-2" style={{ fontSize: 12 }}>The game uses the Hints switch at the top, and cameos are always on. Everyone in the room plays by the same rules.</div>
                     </PopCard>
-                  ) : (
-                    <PopCard className="p-3"><Scoreboard board={board} meId={pid.current} /></PopCard>
                   )}
                 </>
               )}
@@ -1543,7 +1921,7 @@ export default function App() {
 
           {/* PLAY */}
           {tab === "play" && !game && (
-            <div className="px-3 pt-4 pb-6">
+            <div className="fsl-narrow px-3 pt-4 pb-6">
               <PopCard className="p-6 text-center">
                 <div className="flex justify-center"><Reel size={64} spin color={C.marigold} /></div>
                 <div className="mt-3" style={{ fontFamily: DISPLAY, fontSize: 18, color: C.purple }}>No film on the reel yet</div>
@@ -1559,92 +1937,106 @@ export default function App() {
             <div>
               <GameHeader game={game} count={movieCount} />
               <div className="px-3 pt-3 pb-6">
-                <div className="flex flex-wrap gap-2 mb-3">
-                  {[...(game.room ? [`Room ${game.room.code}`, game.room.mode === "coop" ? "Co-op" : "Race"] : []), `Cameos ${cameos ? "on" : "off"}`, `Hints ${hints ? "on" : "off"}`, status].map((t) => <span key={t} className="rounded-full px-3 font-bold" style={{ background: C.teal, color: C.cream, fontSize: 11, border: `2px solid ${C.purple}` }}>{t}</span>)}
-                </div>
-                <FilmChain chain={game.chain} />
+                {partnerLines.length > 0 && (
+                  <div className="mb-3 rounded-xl px-3 py-2" style={{ background: C.purple, color: C.cream, border: `2px solid ${C.marigold}` }} role="status">
+                    {partnerLines.map((l) => <div key={l} className="font-bold" style={{ fontSize: 13 }}>{l}</div>)}
+                  </div>
+                )}
+                <div className="fsl-play">
+                <div><FilmChain chain={game.chain} meId={pid.current} showBy={coopMode} /></div>
+                <div className="fsl-play-b">
                 {!game.won && (
                   <div className="mt-3">
-                    {myTurn ? (
-                      <>
-                        {coopMode && <div className="mb-2 text-center"><span className="rounded-full px-3 py-1 font-bold" style={{ background: C.pink, color: C.cream, border: `2px solid ${C.purple}`, fontSize: 13 }}>Your turn!</span></div>}
-                        <StepInput key={game.chain.length} type={game.chain.length % 2 === 1 ? "movie" : "actor"} prev={game.chain[game.chain.length - 1]} api={api} hints={hints} cameos={cameos} used={used} onPick={attempt} onFail={failApi} />
-                      </>
-                    ) : (
-                      <PopCard className="p-4 text-center">
-                        <div className="flex justify-center"><Reel size={44} spin color={C.marigold} /></div>
-                        <div className="mt-2" style={{ fontFamily: DISPLAY, fontSize: 15, color: C.purple }}>Waiting for {turnName}…</div>
-                        <div className="mt-1" style={{ fontSize: 13 }}>Their pick lands on this board the moment they lock it in.</div>
-                      </PopCard>
-                    )}
+                    <StepInput key={game.chain.length} type={game.chain.length % 2 === 1 ? "movie" : "actor"} prev={game.chain[game.chain.length - 1]} api={api} hints={hints} cameos={cameos} used={used} onPick={attempt} onFail={failApi} />
                   </div>
                 )}
                 {game.won && (
                   <PopCard className="mt-3 p-3 text-center">
                     <div style={{ fontFamily: DISPLAY, fontSize: 15, color: C.purple }}>Link complete!</div>
                     <button onClick={() => setWinOpen(true)} className="mt-2 rounded-xl px-4 py-2 inline-flex items-center gap-2" style={{ ...btn(C.pink), fontSize: 13 }}><Trophy size={16} /> Show results</button>
+                    {game.room && <RoomButtons roomUI={{ voted: iVoted, text: readyText, onNext: voteNext, onLobby: exitToLobby }} />}
                   </PopCard>
                 )}
                 <div className="mt-4 grid grid-cols-2 gap-3">
                   <button onClick={undo} disabled={game.chain.length < 2} className="rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.cream, C.purple), fontSize: 13, opacity: game.chain.length < 2 ? 0.5 : 1 }}><Undo2 size={16} /> Undo last step</button>
                   <button onClick={reset} disabled={game.chain.length < 2} className="rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.cream, C.purple), fontSize: 13, opacity: game.chain.length < 2 ? 0.5 : 1 }}><RotateCcw size={16} /> Reset chain</button>
                 </div>
-                {game.daily && !game.room && (
-                  <button onClick={nextDaily} disabled={launching} className="mt-3 w-full rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.teal), fontSize: 14 }}>Next Challenge ➔</button>
+                {game.room && !game.won && (
+                  <>
+                    <div className="mt-3 grid grid-cols-2 gap-3">
+                      <button onClick={revealLink} disabled={iRevealed} className="rounded-xl py-3" style={{ ...btn(C.teal), fontSize: 13, opacity: iRevealed ? 0.7 : 1 }}>{iRevealed ? "Link requested" : "Reveal Link"}</button>
+                      <button onClick={exitToLobby} className="rounded-xl py-3" style={{ ...btn(C.purple), fontSize: 13 }}>Exit to Lobby</button>
+                    </div>
+                    {(revealText || readyText) && <div className="mt-2 text-center font-bold" style={{ fontSize: 13, color: C.film }}>{revealText || readyText}</div>}
+                  </>
                 )}
+                {!game.room && game.daily && !game.won && (
+                  <button onClick={() => setGame((g) => (g ? { ...g, revealed: true } : g))} className="mt-3 w-full rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.teal), fontSize: 14 }}>Reveal Link</button>
+                )}
+                </div>
+                </div>
                 <div ref={endRef} style={{ height: 1 }} />
               </div>
             </div>
           )}
+          </div>
         </main>
 
         {/* tab bar */}
-        <nav className="relative z-30 flex gap-2 px-3 pt-2" style={{ background: C.cream, borderTop: `3px solid ${C.purple}`, boxShadow: `0 -3px 0 ${C.marigold}`, paddingBottom: "max(env(safe-area-inset-bottom), 8px)" }}>
-          {tabs.map(([k, l, Icon]) => (
-            <button key={k} onClick={() => setTab(k)} aria-current={tab === k ? "page" : undefined} className="flex-1 flex flex-col items-center rounded-xl py-1" style={{ background: tab === k ? C.pink : "transparent", color: tab === k ? C.cream : C.purple }}>
-              <Icon size={22} /><span className="font-bold" style={{ fontSize: 12 }}>{l}</span>
-            </button>
-          ))}
+        <nav className="relative z-30 pt-2" style={{ background: C.cream, borderTop: `3px solid ${C.purple}`, boxShadow: `0 -3px 0 ${C.marigold}`, paddingBottom: "max(env(safe-area-inset-bottom), 8px)" }}>
+          <div className="fsl-narrow flex gap-2 px-3">
+            {tabs.map(([k, l, Icon]) => (
+              <button key={k} onClick={() => setTab(k)} aria-current={tab === k ? "page" : undefined} className="flex-1 flex flex-col items-center rounded-xl py-1" style={{ background: tab === k ? C.pink : "transparent", color: tab === k ? C.cream : C.purple }}>
+                <Icon size={22} /><span className="font-bold" style={{ fontSize: 12 }}>{l}</span>
+              </button>
+            ))}
+          </div>
         </nav>
 
-        {/* settings drawer */}
-        <div className="absolute inset-0 z-50" style={{ pointerEvents: drawer ? "auto" : "none" }}>
-          <div onClick={() => setDrawer(false)} className="absolute inset-0" style={{ background: "rgba(42,14,44,.62)", opacity: drawer ? 1 : 0, transition: "opacity .3s" }} />
-          <aside className="absolute top-0 bottom-0 right-0 overflow-y-auto" style={{ width: "90%", maxWidth: 380, background: C.cream, borderLeft: `4px solid ${C.purple}`, boxShadow: `-4px 0 0 ${C.marigold}`, transform: drawer ? "translateX(0)" : "translateX(105%)", transition: "transform .3s ease", paddingTop: "max(env(safe-area-inset-top), 12px)" }} aria-hidden={!drawer}>
-            <div className="flex items-center justify-between px-4 pb-2">
-              <div style={{ fontFamily: DISPLAY, fontSize: 22, color: C.purple }}>Settings</div>
-              <button onClick={() => setDrawer(false)} aria-label="Close settings" className="rounded-full flex items-center justify-center" style={{ width: 38, height: 38, border: `3px solid ${C.purple}`, background: C.cream }}><X size={18} color={C.purple} /></button>
-            </div>
-            <Scallop color={C.pink} flip size={16} />
-            <div className="px-4 pb-8">
-              <Toggle on={cameos} onChange={setCameos} label="Include cameos" desc="Off: uncredited, cameo, special or guest appearances, archive footage and himself/herself credits don’t count, and the shortest-link solver follows the same rule. Documentaries, talk shows and award shows are always out. On: every credited feature-film appearance counts." />
-              <div style={{ borderTop: `2px dashed ${C.purple}55` }} />
-              <Toggle on={hints} onChange={setHints} label="Dropdown hints" desc="Off: type 3+ letters for spelling help; green or red shows only after you pick. On: tap a box to see the valid movies or co-stars straight away." />
-              <div style={{ borderTop: `2px dashed ${C.purple}55` }} />
-              <div className="py-3">
-                <div className="flex items-center gap-2" style={{ fontFamily: DISPLAY, fontSize: 15, color: C.purple }}><KeyRound size={18} /> TMDB API key</div>
-                <div className="mt-1" style={{ fontSize: 13, lineHeight: 1.25 }}>{ENV_KEY ? "This app already comes with a TMDB key, so every film and actor is searchable. Paste your own here only if you want to override it. It stays on this device." : "Paste your TMDB Read Access Token or API key to search every film and actor with real posters. It stays on this device."}</div>
-                <div className="mt-2 flex items-center gap-2 rounded-xl px-3" style={{ background: "#fff", border: `3px solid ${C.teal}`, height: 48 }}>
-                  <input value={draft} onChange={(e) => setDraft(e.target.value)} type={showKey ? "text" : "password"} placeholder="Paste token or key" className="flex-1 min-w-0 bg-transparent outline-none font-bold" style={{ fontSize: 15, color: C.ink }} autoComplete="off" spellCheck={false} />
-                  <button onClick={() => setShowKey(!showKey)} aria-label={showKey ? "Hide key" : "Show key"}>{showKey ? <EyeOff size={18} color={C.teal} /> : <Eye size={18} color={C.teal} />}</button>
-                </div>
-                <div className="mt-3 grid grid-cols-2 gap-3">
-                  <button onClick={() => saveKey(draft)} className="rounded-xl py-2" style={{ ...btn(C.teal), fontSize: 13 }}>Save key</button>
-                  <button onClick={() => { setDraft(""); saveKey(""); }} className="rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}>Clear</button>
-                </div>
-                <div className="mt-3 flex items-center gap-2 font-bold" style={{ fontSize: 13, color: tmdbState === "fail" ? C.crimson : C.teal }}>
-                  {tmdbState === "checking" ? <Reel size={18} spin color={C.marigold} /> : <Film size={16} />} Source: {status}
-                </div>
-              </div>
-            </div>
-          </aside>
-        </div>
-
         {winOpen && game && game.won && (
-          <WinModal game={game} optimal={optimal} onShare={shareResult} onClose={() => setWinOpen(false)} onAgain={() => { reset(); setWinOpen(false); }} onMenu={() => { setWinOpen(false); setTab(game.room ? "rooms" : "daily"); }} board={game.room && game.room.mode !== "coop" ? board : null} meId={pid.current} onNext={game.daily && !game.room ? nextDaily : null} />
+          <WinModal game={game} optimal={optimal} onShare={shareResult} onClose={() => setWinOpen(false)} onAgain={() => { reset(); setWinOpen(false); }} onMenu={() => { setWinOpen(false); setTab("daily"); }} board={game.room && game.room.mode === "race" ? board : null} meId={pid.current} onNext={game.daily && !game.room ? nextDaily : null} roomUI={game.room ? { voted: iVoted, text: readyText, onNext: voteNext, onLobby: exitToLobby } : null} />
         )}
-        {scorecard && (
-          <ScoreCard card={scorecard} meId={pid.current} wins={wins} onNext={nextChallenge} onRoom={() => { setScorecard(null); setTab("rooms"); }} onClose={() => setScorecard(null)} />
+        {showAnswer && (
+          <AnswerScreen game={game} answer={answer}
+            solo={!game.room ? { onNext: nextDaily, onMore: () => { setGame((g) => (g ? { ...g, revealed: false } : g)); setTab("daily"); }, onBack: () => setGame((g) => (g ? { ...g, revealed: false } : g)) } : null}
+            room={game.room ? { voted: iVoted, text: readyText, onNext: voteNext, onLobby: exitToLobby } : null} />
+        )}
+        {showPairing && (
+          <div className="absolute inset-0 flex items-center justify-center px-3" style={{ background: "rgba(42,14,44,.84)", zIndex: 46 }}>
+            <PopCard className="relative w-full overflow-y-auto" style={{ maxHeight: "92%", maxWidth: 560, animation: "rise .5s ease-out" }}>
+              <Scallop color={C.pink} size={18} />
+              <div className="px-4 pt-3 pb-4 text-center">
+                {pendingMine ? (
+                  <>
+                    <div style={{ fontFamily: DISPLAY, fontSize: 18, color: C.purple }}>Your turn to pick!</div>
+                    <div className="mt-1" style={{ fontSize: 13, lineHeight: 1.25 }}>Choose the starting and target actors for the next game. Your partner is waiting.</div>
+                    <div className="mt-3 flex items-stretch gap-2">{slotBox("a")}<div className="flex items-center"><Reel size={24} spin color={C.marigold} /></div>{slotBox("b")}</div>
+                    <div className="mt-3 flex items-center gap-2 rounded-xl px-3" style={{ background: "#fff", border: `3px solid ${C.teal}`, height: 50 }}>
+                      <Search size={19} color={C.teal} />
+                      <input value={cq} onChange={(e) => setCq(e.target.value)} placeholder={slot === "a" ? "Search the starting actor…" : "Search the target actor…"} aria-label="Search actors" className="flex-1 min-w-0 bg-transparent outline-none font-bold text-left" style={{ fontSize: 16, color: C.ink }} autoComplete="off" spellCheck={false} />
+                    </div>
+                    {cres.length > 0 && <div className="mt-2 rounded-xl overflow-y-auto text-left" style={{ maxHeight: 220, background: C.cream, border: `2px solid ${C.purple}` }}>{cres.map((a) => <Row key={a.id} item={a} type="actor" onClick={() => fillSlot(a)} />)}</div>}
+                    {cq.trim().length >= 2 && cres.length === 0 && <div className="mt-2" style={{ fontSize: 13 }}>No matches yet. {api.kind === "local" ? "The built-in reel doesn’t have that actor yet." : ""}</div>}
+                    <button onClick={submitPairing} disabled={launching} className="mt-3 w-full rounded-xl py-3 flex items-center justify-center gap-2" style={{ ...btn(C.pink), fontSize: 15 }}><Play size={18} /> Start game</button>
+                    {liveList.some((p) => p.id !== pid.current) && (
+                      <button onClick={() => setPicker(liveList.find((p) => p.id !== pid.current).id)} className="mt-3 w-full rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}>Let {liveList.find((p) => p.id !== pid.current).name} pick instead</button>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div className="flex justify-center"><Reel size={56} spin color={C.marigold} /></div>
+                    <div className="mt-3" style={{ fontFamily: DISPLAY, fontSize: 17, color: C.purple, lineHeight: 1.2 }}>Waiting for other player to give pairing…</div>
+                    <div className="mt-1" style={{ fontSize: 13 }}>{pending.pickerName} is choosing the next actors. The game starts as soon as they’re set.</div>
+                    <button onClick={() => setPicker(pid.current)} className="mt-3 w-full rounded-xl py-2" style={{ ...btn(C.cream, C.purple), fontSize: 13 }}>Pick it myself</button>
+                  </>
+                )}
+                <button onClick={() => { setPairingHidden(round); setTab("rooms"); }} className="mt-3 text-center font-bold" style={{ fontSize: 12, color: C.teal }}>Back to lobby</button>
+              </div>
+            </PopCard>
+          </div>
+        )}
+        {results && (
+          <RaceResults card={results} game={game} meId={pid.current} wins={wins} roomUI={{ voted: iVoted, text: readyText, onNext: voteNext, onLobby: exitToLobby }} onClose={() => setResults(null)} />
         )}
         {toast && (
           <div className="absolute left-0 right-0 flex justify-center px-4 pointer-events-none" style={{ bottom: 84, zIndex: 60 }}>
